@@ -137,17 +137,22 @@ namespace GHelper.Fan
         public void StartCalibration()
         {
 
-            measuredMax = new int[] { 0, 0, 0 };
-            timer.Enabled = true;
+            using (XgMitigation.Explicit(XgOp.Profile | XgOp.Fan))
+            {
+                int modeResult = Program.acpi.DeviceSet(AsusACPI.PerformanceMode, AsusACPI.PerformanceTurbo, "ModeCalibration");
+                if (modeResult == XgMitigation.Suppressed) return;
 
+                for (int i = 0; i < FAN_COUNT; i++)
+                {
+                    int curveResult = Program.acpi.SetFanCurve((AsusFan)i, new byte[] { 20, 30, 40, 50, 60, 70, 80, 90, 100, 100, 100, 100, 100, 100, 100, 100 });
+                    if (curveResult == XgMitigation.Suppressed) return;
+                }
+            }
+
+            measuredMax = new int[] { 0, 0, 0 };
             for (int i = 0; i < FAN_COUNT; i++)
                 AppConfig.Remove("fan_max_" + i);
-
-            Program.acpi.DeviceSet(AsusACPI.PerformanceMode, AsusACPI.PerformanceTurbo, "ModeCalibration");
-
-            for (int i = 0; i < FAN_COUNT; i++)
-                Program.acpi.SetFanCurve((AsusFan)i, new byte[] { 20, 30, 40, 50, 60, 70, 80, 90, 100, 100, 100, 100, 100, 100, 100, 100 });
-
+            timer.Enabled = true;
         }
 
         private void Timer_Elapsed(object? sender, System.Timers.ElapsedEventArgs e)
@@ -191,7 +196,8 @@ namespace GHelper.Fan
         {
 
             timer.Enabled = false;
-            modeControl.SetPerformanceMode();
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                modeControl.SetPerformanceMode();
 
             string label = "Measured - CPU: " + AppConfig.Get("fan_max_" + (int)AsusFan.CPU) * 100;
 

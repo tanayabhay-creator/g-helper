@@ -1,4 +1,5 @@
 ﻿using GHelper.Helpers;
+using GHelper.Mode;
 using NvAPIWrapper.GPU;
 using NvAPIWrapper.Native;
 using NvAPIWrapper.Native.GPU;
@@ -388,5 +389,98 @@ public class NvidiaGpuControl : IGpuControl
         if (GetGpuState() != GpuState.Active) return null;
         return NvmlHelper.GetMemoryInfo();
     }
+
+    public static string TryApplyPolicyWatts(int watts)
+    {
+        if (!NvidiaWattWrite.MayAttempt(NvidiaWattTrigger.ExplicitClick, XgDockSnapshot.Unsampled(), false))
+            return "NVIDIA watt writes are disabled. A driver rejection is not a lock.";
+        if (!TryPolicyEntry(out var entry, out string listing))
+            return listing;
+        if (!TryReferenceWatts(out double reference))
+            return $"NVML refused a watt limit. NVIDIA policy range is {Percent(entry.MinimumPowerInPCM)}–{Percent(entry.MaximumPowerInPCM)}%. No watt reference was read, so {watts}W was not written.";
+        double referencePercent = Percent(entry.DefaultPowerInPCM);
+        if (referencePercent <= 0) referencePercent = 100;
+        if (!NvidiaPolicyTarget.TryTargetPcm(watts, reference, referencePercent, entry.MinimumPowerInPCM, entry.MaximumPowerInPCM, out uint pcm))
+        {
+            double minW = NvidiaPolicyTarget.WattsForPcm(entry.MinimumPowerInPCM, reference, referencePercent);
+            double maxW = NvidiaPolicyTarget.WattsForPcm(entry.MaximumPowerInPCM, reference, referencePercent);
+            return $"The NVIDIA policy allows {minW:0}–{maxW:0}W. {watts}W was not written.";
+        }
+        return WritePolicy(pcm, $"The NVIDIA policy target is {pcm / 1000.0:0.#}% of the {reference:0}W default.");
+    }
+
+    public static string TryRestorePolicyDefault()
+    {
+        if (!NvidiaWattWrite.MayAttempt(NvidiaWattTrigger.ExplicitClick, XgDockSnapshot.Unsampled(), false))
+            return "NVIDIA watt writes are disabled. A driver rejection is not a lock.";
+        if (!TryPolicyEntry(out var entry, out string listing))
+            return listing;
+        return WritePolicy(entry.DefaultPowerInPCM, $"The NVIDIA policy target was restored to {Percent(entry.DefaultPowerInPCM):0.#}%.");
+    }
+
+    static bool TryPolicyEntry(out PrivatePowerPoliciesInfoV1.PowerPolicyInfoEntry entry, out string listing)
+    {
+        entry = default;
+        listing = "The NVIDIA GPU is not available for a policy limit.";
+        if (_internalGpu is null) return false;
+        try
+        {
+            var entries = GPUApi.ClientPowerPoliciesGetInfo(_internalGpu.Handle).PowerPolicyInfoEntries;
+            if (entries is null || entries.Length == 0)
+            {
+                listing = "The NVIDIA policy list is empty.";
+                return false;
+            }
+            listing = string.Join("; ", entries.Select(item =>
+                $"{item.PerformanceStateId} {Percent(item.MinimumPowerInPCM):0.#}-{Percent(item.MaximumPowerInPCM):0.#}% default {Percent(item.DefaultPowerInPCM):0.#}%"));
+            Logger.WriteLine("NVAPI power policy: " + listing);
+            int index = Array.FindIndex(entries, item => item.PerformanceStateId == PerformanceStateId.P0_3DPerformance);
+            if (index < 0)
+            {
+                listing = "The NVIDIA policy has no P0 entry. " + listing;
+                return false;
+            }
+            entry = entries[index];
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.WriteLine("NVAPI power policy: " + ex.GetType().Name + " " + ex.Message);
+            listing = "The NVIDIA policy interface refused the power limit (" + ex.GetType().Name + ").";
+            return false;
+        }
+    }
+
+    static bool TryReferenceWatts(out double reference)
+    {
+        if (NvidiaSmi.TryReadLimitWatts("power.default_limit", out reference)) return true;
+        return NvidiaSmi.TryReadLimitWatts("power.max_limit", out reference);
+    }
+
+    static string WritePolicy(uint pcm, string success)
+    {
+        if (_internalGpu is null) return "The NVIDIA GPU is not available for a policy limit.";
+        try
+        {
+            var status = new PrivatePowerPoliciesStatusV1(new[]
+            {
+                new PrivatePowerPoliciesStatusV1.PowerPolicyStatusEntry(pcm)
+            });
+            GPUApi.ClientPowerPoliciesSetStatus(_internalGpu.Handle, status);
+            var readback = GPUApi.ClientPowerPoliciesGetStatus(_internalGpu.Handle).PowerPolicyStatusEntries;
+            uint? got = readback is { Length: > 0 } ? readback[0].PowerTargetInPCM : null;
+            Logger.WriteLine($"NVAPI power policy write pcm={pcm} readback={got?.ToString() ?? "none"}");
+            if (got is uint value && Math.Abs((long)value - pcm) <= 1000)
+                return success;
+            return $"The NVIDIA policy call returned, and the target still reads {(got is uint seen ? (seen / 1000.0).ToString("0.#") + "%" : "nothing")}.";
+        }
+        catch (Exception ex)
+        {
+            Logger.WriteLine("NVAPI power policy write: " + ex.GetType().Name + " " + ex.Message);
+            return "The NVIDIA policy interface refused the power limit (" + ex.GetType().Name + ").";
+        }
+    }
+
+    static double Percent(uint pcm) => pcm / 1000.0;
 
 }

@@ -344,6 +344,10 @@ namespace GHelper.Ally
 
         private void SetTDP(int tdp, string log)
         {
+            using var lease = XgMitigation.Shared.Enter("Ally.SetTDP", "DEVS", XgOp.Power);
+            if (!lease.Allowed) return;
+            if (!lease.Enforced && Program.acpi.IsXGActive()) return;
+
             if (tdp < tdpStable) tdp = tdpStable;
 
             int max = GetMaxTDP();
@@ -352,9 +356,11 @@ namespace GHelper.Ally
             if (tdp == tdpCurrent) return;
             if (!autoTDP) return;
 
-            Program.acpi.DeviceSet(AsusACPI.PPT_APUA0, tdp, log);
-            Program.acpi.DeviceSet(AsusACPI.PPT_APUA3, tdp, null);
-            Program.acpi.DeviceSet(AsusACPI.PPT_APUC1, tdp, null);
+            int slow = Program.acpi.DeviceSet(AsusACPI.PPT_APUA0, tdp, log);
+            int sustained = Program.acpi.DeviceSet(AsusACPI.PPT_APUA3, tdp, null);
+            int fast = Program.acpi.DeviceSet(AsusACPI.PPT_APUC1, tdp, null);
+            if (slow == XgMitigation.Suppressed || sustained == XgMitigation.Suppressed || fast == XgMitigation.Suppressed)
+                return;
 
             tdpCurrent = tdp;
         }

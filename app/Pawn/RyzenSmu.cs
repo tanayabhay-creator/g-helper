@@ -147,20 +147,42 @@ namespace PawnIO
         public bool CanSetThm()   => _cpu is not CpuCodeName.Undefined;
 
         public bool SetAllLimits(int stapmW, int fastW, int slowW)
-            => SetStapm(stapmW) == SmuStatus.OK & SetFast(fastW) == SmuStatus.OK & SetSlow(slowW) == SmuStatus.OK;
+        {
+            SetAllLimits(stapmW, fastW, slowW, out SmuStatus stapm, out SmuStatus fast, out SmuStatus slow);
+            return stapm == SmuStatus.OK & fast == SmuStatus.OK & slow == SmuStatus.OK;
+        }
 
         public void SetAllLimits(int stapmW, int fastW, int slowW,
             out SmuStatus stapm, out SmuStatus fast, out SmuStatus slow)
         {
-            stapm = SetStapm(stapmW);
-            fast  = SetFast(fastW);
-            slow  = SetSlow(slowW);
+            stapm = SmuStatus.Failed;
+            fast = SmuStatus.Failed;
+            slow = SmuStatus.Failed;
+            using var lease = XgMitigation.Shared.Enter("SetAllLimits", "SMU", XgOp.Power);
+            if (!lease.Allowed) return;
+            try
+            {
+                stapm = SetStapm(stapmW);
+                fast = SetFast(fastW);
+                slow = SetSlow(slowW);
+            }
+            catch (Exception ex)
+            {
+                XgMitigation.Shared.LogFailed(lease, "SetAllLimits", "SMU", $"{stapmW}/{fastW}/{slowW}", ex.GetType().Name);
+                throw;
+            }
+            XgMitigation.Shared.LogCompleted(lease, "SetAllLimits", "SMU", $"{stapmW}/{fastW}/{slowW}", $"{stapm}/{fast}/{slow}");
         }
 
         public SmuStatus SetCoAll(int value)
         {
+            using var lease = XgMitigation.Shared.Enter("SetCoAll", "SMU", XgOp.Uv);
+            if (!lease.Allowed) return SmuStatus.Failed;
             uint v = EncodeCurve(value);
-            return Family switch
+            SmuStatus status;
+            try
+            {
+                status = Family switch
             {
                 // RyzenAdj: _do_adjust(0x55) — MP1 only
                 CpuFamily.Renoir                         => SendMp1(0x55, v),
@@ -172,27 +194,53 @@ namespace PawnIO
                 CpuFamily.Raphael                        => SendPsmu(0x07, v),
                 _                                        => SmuStatus.Failed,
             };
+            }
+            catch (Exception ex)
+            {
+                XgMitigation.Shared.LogFailed(lease, "SetCoAll", "SMU", value.ToString(), ex.GetType().Name);
+                throw;
+            }
+            XgMitigation.Shared.LogCompleted(lease, "SetCoAll", "SMU", value.ToString(), status.ToString());
+            return status;
         }
 
         public SmuStatus SetCoPer(int core, int value)
         {
+            using var lease = XgMitigation.Shared.Enter("SetCoPer", "SMU", XgOp.Uv);
+            if (!lease.Allowed) return SmuStatus.Failed;
             // UXTU: ((ccd << 8 | core) << 20) | (offset & 0xFFFF); ccd bits only on DragonRange
             uint sel = Family == CpuFamily.Raphael ? (uint)(core / 8 << 8 | core % 8) : (uint)core;
             uint v = sel << 20 | ((uint)value & 0xFFFF);
-            return Family switch
+            SmuStatus status;
+            try
             {
-                CpuFamily.Renoir                         => SendMp1(0x54, v),
-                CpuFamily.Mobile or CpuFamily.StrixPoint
-                or CpuFamily.StrixHalo                   => SendMp1(0x4B, v),
-                CpuFamily.Raphael                        => SendPsmu(0x06, v),
-                _                                        => SmuStatus.Failed,
-            };
+                status = Family switch
+                {
+                    CpuFamily.Renoir                         => SendMp1(0x54, v),
+                    CpuFamily.Mobile or CpuFamily.StrixPoint
+                    or CpuFamily.StrixHalo                   => SendMp1(0x4B, v),
+                    CpuFamily.Raphael                        => SendPsmu(0x06, v),
+                    _                                        => SmuStatus.Failed,
+                };
+            }
+            catch (Exception ex)
+            {
+                XgMitigation.Shared.LogFailed(lease, "SetCoPer", "SMU", core + ":" + value, ex.GetType().Name);
+                throw;
+            }
+            XgMitigation.Shared.LogCompleted(lease, "SetCoPer", "SMU", core + ":" + value, status.ToString());
+            return status;
         }
 
         public SmuStatus SetCoGfx(int value)
         {
+            using var lease = XgMitigation.Shared.Enter("SetCoGfx", "SMU", XgOp.Uv);
+            if (!lease.Allowed) return SmuStatus.Failed;
             uint v = EncodeCurve(value);
-            return Family switch
+            SmuStatus status;
+            try
+            {
+                status = Family switch
             {
                 // RyzenAdj: _do_adjust(0x64) — MP1 only
                 CpuFamily.Renoir                                 => SendMp1(0x64, v),
@@ -202,12 +250,25 @@ namespace PawnIO
                 // StrixPoint/KrackanPoint: no set-cogfx in UXTU or RyzenAdj
                 _                                                => SmuStatus.Failed,
             };
+            }
+            catch (Exception ex)
+            {
+                XgMitigation.Shared.LogFailed(lease, "SetCoGfx", "SMU", value.ToString(), ex.GetType().Name);
+                throw;
+            }
+            XgMitigation.Shared.LogCompleted(lease, "SetCoGfx", "SMU", value.ToString(), status.ToString());
+            return status;
         }
 
         public SmuStatus SetThm(int celsius)
         {
+            using var lease = XgMitigation.Shared.Enter("SetThm", "SMU", XgOp.Thermal);
+            if (!lease.Allowed) return SmuStatus.Failed;
             uint v = (uint)celsius;
-            return Family switch
+            SmuStatus status;
+            try
+            {
+                status = Family switch
             {
                 // RyzenAdj: _do_adjust(0x1F) — MP1 only
                 CpuFamily.Raven                          => SendMp1(0x1F, v),
@@ -220,6 +281,14 @@ namespace PawnIO
                 CpuFamily.Raphael                        => SendMp1(0x3F, v),
                 _                                        => SmuStatus.Failed,
             };
+            }
+            catch (Exception ex)
+            {
+                XgMitigation.Shared.LogFailed(lease, "SetThm", "SMU", celsius.ToString(), ex.GetType().Name);
+                throw;
+            }
+            XgMitigation.Shared.LogCompleted(lease, "SetThm", "SMU", celsius.ToString(), status.ToString());
+            return status;
         }
 
         public bool GetCodeName(out CpuCodeName codeName)

@@ -20,6 +20,7 @@
     <IntermediateOutputPath>obj\x64\$(Configuration)\</IntermediateOutputPath>
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
     <AssemblyVersion>0.289</AssemblyVersion>
+    <InformationalVersion>0.289.1102.11-xg-no-nv-write</InformationalVersion>
     <NoWarn>$(NoWarn);WFO1000</NoWarn>
   </PropertyGroup>
 

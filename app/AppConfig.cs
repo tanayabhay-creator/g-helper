@@ -635,6 +635,7 @@ public static class AppConfig
     }
 
     public static bool IsApplyPower() => IsMode("auto_apply_power");
+    public static bool IsApplyGpuPower() => IsMode("auto_apply_gpu");
     public static bool IsApplyFans() => IsMode("auto_apply");
     public static bool IsApplyUV() => IsMode("auto_uv");
 

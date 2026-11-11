@@ -329,6 +329,7 @@ public class AsusACPI
         {
             MaxTotal = 50;
             DefaultTotal = 30;
+            XgMitigation.Shared.Enable(ReadDockSnapshot);
         }
 
         if (AppConfig.IsIntelHX())
@@ -383,18 +384,44 @@ public class AsusACPI
 
     public void Control(uint dwIoControlCode, byte[] lpInBuffer, byte[] lpOutBuffer)
     {
+        ControlObserved(dwIoControlCode, lpInBuffer, lpOutBuffer);
+    }
 
-        uint lpBytesReturned = 0;
-        DeviceIoControl(
-            handle,
-            dwIoControlCode,
-            lpInBuffer,
-            (uint)lpInBuffer.Length,
-            lpOutBuffer,
-            (uint)lpOutBuffer.Length,
-            ref lpBytesReturned,
-            IntPtr.Zero
-        );
+    // SetLastError is set on the P/Invoke. GetLastWin32Error is meaningful only after a false return,
+    // and only as a recorded number. This code does not map that number to a cause.
+    private readonly struct Transport
+    {
+        public bool IoctlSucceeded { get; init; }
+        public uint BytesReturned { get; init; }
+        public int Win32Error { get; init; }
+        public byte[] Buffer { get; init; }
+    }
+
+    private Transport ControlObserved(uint dwIoControlCode, byte[] lpInBuffer, byte[] lpOutBuffer)
+    {
+        uint bytes = 0;
+        bool ok = false;
+        int error = 0;
+        try
+        {
+            ok = DeviceIoControl(
+                handle,
+                dwIoControlCode,
+                lpInBuffer,
+                (uint)lpInBuffer.Length,
+                lpOutBuffer,
+                (uint)lpOutBuffer.Length,
+                ref bytes,
+                IntPtr.Zero
+            );
+            error = Marshal.GetLastWin32Error();
+        }
+        catch
+        {
+            ok = false;
+            error = Marshal.GetLastWin32Error();
+        }
+        return new Transport { IoctlSucceeded = ok, BytesReturned = bytes, Win32Error = error, Buffer = lpOutBuffer };
     }
 
     public void Close()
@@ -405,19 +432,19 @@ public class AsusACPI
 
     protected byte[] CallMethod(uint MethodID, byte[] args)
     {
+        return CallObserved(MethodID, args).Buffer;
+    }
+
+    private Transport CallObserved(uint methodId, byte[] args)
+    {
         byte[] acpiBuf = new byte[8 + args.Length];
         byte[] outBuffer = new byte[16];
 
-        BitConverter.GetBytes((uint)MethodID).CopyTo(acpiBuf, 0);
+        BitConverter.GetBytes((uint)methodId).CopyTo(acpiBuf, 0);
         BitConverter.GetBytes((uint)args.Length).CopyTo(acpiBuf, 4);
         Array.Copy(args, 0, acpiBuf, 8, args.Length);
 
-        // if (MethodID == DEVS)  Debug.WriteLine(BitConverter.ToString(acpiBuf, 0, acpiBuf.Length));
-
-        Control(CONTROL_CODE, acpiBuf, outBuffer);
-
-        return outBuffer;
-
+        return ControlObserved(CONTROL_CODE, acpiBuf, outBuffer);
     }
 
     public byte[] DeviceInit()
@@ -436,37 +463,72 @@ public class AsusACPI
 
     public int DeviceSet(uint DeviceID, int Status, string? logName)
     {
-        byte[] args = new byte[8];
-        BitConverter.GetBytes((uint)DeviceID).CopyTo(args, 0);
-        BitConverter.GetBytes((uint)Status).CopyTo(args, 4);
-
-        byte[] status = CallMethod(DEVS, args);
-        int result = BitConverter.ToInt32(status, 0);
-
-        if (logName is not null)
-            Logger.WriteLine(logName + " = " + Status + " : " + (result == 1 ? "OK" : result));
-
-        return result;
+        DevsOutcome Write() => WriteDevs(DeviceID, Status, logName);
+        if (DeviceID == GPUXG)
+            return XgMitigation.Shared.RunLifecycle(logName ?? "GPU XGM", DeviceID, Status.ToString(), Write);
+        if (XgMitigation.IsGuardedDevice(DeviceID))
+            return XgMitigation.Shared.RunGuarded(logName ?? "DeviceSet", DeviceID, Status.ToString(), Write);
+        return Write().Result;
     }
 
 
     public int DeviceSet(uint DeviceID, byte[] Params, string? logName)
     {
-        byte[] args = new byte[4 + Params.Length];
-        BitConverter.GetBytes((uint)DeviceID).CopyTo(args, 0);
-        Params.CopyTo(args, 4);
+        string requested = BitConverter.ToString(Params);
+        DevsOutcome Write() => WriteDevs(DeviceID, Params, logName);
+        if (DeviceID == GPUXG)
+            return XgMitigation.Shared.RunLifecycle(logName ?? "GPU XGM", DeviceID, requested, Write);
+        if (XgMitigation.IsGuardedDevice(DeviceID))
+            return XgMitigation.Shared.RunGuarded(logName ?? "DeviceSet", DeviceID, requested, Write);
+        return Write().Result;
+    }
 
-        byte[] status = CallMethod(DEVS, args);
-        int result = BitConverter.ToInt32(status, 0);
+    private DevsOutcome WriteDevs(uint deviceId, int status, string? logName)
+    {
+        byte[] args = new byte[8];
+        BitConverter.GetBytes(deviceId).CopyTo(args, 0);
+        BitConverter.GetBytes((uint)status).CopyTo(args, 4);
+        return FinishDevs(CallObserved(DEVS, args), logName, status.ToString());
+    }
 
+    private DevsOutcome WriteDevs(uint deviceId, byte[] parms, string? logName)
+    {
+        byte[] args = new byte[4 + parms.Length];
+        BitConverter.GetBytes(deviceId).CopyTo(args, 0);
+        parms.CopyTo(args, 4);
+        return FinishDevs(CallObserved(DEVS, args), logName, BitConverter.ToString(parms));
+    }
+
+    private static DevsOutcome FinishDevs(Transport transport, string? logName, string requested)
+    {
+        int result = BitConverter.ToInt32(transport.Buffer, 0);
         if (logName is not null)
-            Logger.WriteLine(logName + " = " + BitConverter.ToString(Params) + " : " + (result == 1 ? "OK" : result));
-
-        return BitConverter.ToInt32(status, 0);
+            Logger.WriteLine(logName + " = " + requested + " : " + (result == 1 ? "OK" : result));
+        return new DevsOutcome
+        {
+            Result = result,
+            IoctlSucceeded = transport.IoctlSucceeded,
+            BytesReturned = transport.BytesReturned,
+            Win32Error = transport.Win32Error
+        };
     }
 
 
     public static void DeviceSetWmi(uint DeviceID, int Status)
+    {
+        if (XgMitigation.IsGuardedDevice(DeviceID))
+        {
+            using var lease = XgMitigation.Shared.Enter("DeviceSetWmi", "WMI.DEVS", XgMitigation.OperationForDevice(DeviceID), DeviceID, Status.ToString());
+            if (!lease.Allowed) return;
+            WriteWmiDevs(DeviceID, Status);
+            XgMitigation.Shared.LogCompleted(lease, "DeviceSetWmi", "WMI.DEVS", Status.ToString(), "wmi_called");
+            return;
+        }
+
+        WriteWmiDevs(DeviceID, Status);
+    }
+
+    static void WriteWmiDevs(uint DeviceID, int Status)
     {
         try
         {
@@ -485,12 +547,26 @@ public class AsusACPI
 
     public int DeviceGet(uint DeviceID)
     {
+        return ReadDecoded(DeviceID).Decoded;
+    }
+
+    public DecodedRead ReadDecoded(uint deviceId)
+    {
         byte[] args = new byte[8];
-        BitConverter.GetBytes((uint)DeviceID).CopyTo(args, 0);
-        byte[] status = CallMethod(DSTS, args);
+        BitConverter.GetBytes(deviceId).CopyTo(args, 0);
+        var transport = CallObserved(DSTS, args);
+        return new DecodedRead
+        {
+            IoctlSucceeded = transport.IoctlSucceeded,
+            BytesReturned = transport.BytesReturned,
+            Win32Error = transport.Win32Error,
+            Buffer = transport.Buffer
+        };
+    }
 
-        return BitConverter.ToInt32(status, 0) - 65536;
-
+    public XgDockSnapshot ReadDockSnapshot()
+    {
+        return XgDockClassifier.FromReads(ReadDecoded(GPUXGConnected), ReadDecoded(GPUXG));
     }
 
     public byte[] DeviceGetBuffer(uint DeviceID, uint Status = 0)
@@ -759,7 +835,14 @@ public class AsusACPI
 
     public bool IsXGConnected()
     {
-        return IsSupported(GPUXGConnected) && DeviceGet(GPUXGConnected) == 1;
+        // A failed read is not cached. IsSupported keeps a permanent false for other IDs; the dock does not use that cache.
+        return XgDockClassifier.Classify(ReadDecoded(GPUXGConnected)) == XgValueClass.One;
+    }
+
+    public bool IsXGActive()
+    {
+        // Connected is not enough. Active requires a successful decoded 1 from both the connected ID and GPUXG.
+        return ReadDockSnapshot().State == XgDockState.Active;
     }
 
     public bool IsExternalDisplayConnected()
@@ -782,6 +865,8 @@ public class AsusACPI
 
     public bool IsSupported(uint DeviceID)
     {
+        // The first result, including a failed read, stays for the process lifetime.
+        // Dock decisions do not call this.
         if (!_supportCache.TryGetValue(DeviceID, out bool supported))
         {
             supported = DeviceGet(DeviceID) >= 0;

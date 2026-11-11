@@ -39,13 +39,75 @@ namespace GHelper
         FanSensorControl fanSensorControl;
 
         static int gpuPowerBase = 0;
-        static bool isGPUPower => gpuPowerBase > 0;
+        bool gpuPowerReady;
+        DecodedRead gpuBaseRead;
+        DecodedRead gpuPowerRead;
+        int? gpuMeasuredMax;
+        bool gpuEco;
+        string? gpuInitFault;
+        string? lastGpuDiagnostic;
+        GpuPowerCapability.Result gpuPowerCapability = GpuPowerCapability.Result.Unavailable;
+        bool gpuLimitPowerSupported;
+        bool gpuLimitBoostSupported;
+        bool gpuLimitTempSupported;
+        bool gpuClockOffsetSupported;
+        bool gpuClockLimitSupported;
+        bool gpuNvidiaPresent;
+        bool gpuBoostResponds;
+        bool gpuTempResponds;
+        bool loadingGpuLimits;
+        bool gpuGesture;
+        bool gpuDisplayCommitted;
+        int gestureBoost = -1;
+        int gestureTemp = -1;
+        int gesturePower = -1;
+        int committedBoost;
+        int committedTemp;
+        int committedPower;
+        Label? labelGpuLimitLock;
+        bool loadingGpuApply;
+        RCheckBox checkApplyGpuLimits = null!;
         static bool clampFanDots = AppConfig.IsClampFanDots();
 
         public Fans()
         {
 
             InitializeComponent();
+
+            labelGpuLimitLock = new Label
+            {
+                Name = "labelGpuLimitLock",
+                AutoSize = true,
+                Visible = false,
+                Dock = DockStyle.Top,
+                Padding = new Padding(8, 6, 8, 6),
+                Text = XgMitigation.GpuLimitsLockedText
+            };
+            panelGPU.Controls.Add(labelGpuLimitLock);
+            labelGpuLimitLock.BringToFront();
+
+            var panelApplyGpuLimits = new Panel
+            {
+                Name = "panelApplyGpuLimits",
+                AutoSize = true,
+                Dock = DockStyle.Top,
+                Padding = new Padding(15)
+            };
+            checkApplyGpuLimits = new RCheckBox
+            {
+                Name = "checkApplyGpuLimits",
+                Text = Properties.Strings.ApplyPowerLimits,
+                Dock = DockStyle.Top,
+                Margin = new Padding(0),
+                Padding = new Padding(16, 6, 16, 6),
+                Height = 46,
+                BackColor = SystemColors.ControlLight,
+                UseVisualStyleBackColor = false
+            };
+            checkApplyGpuLimits.Click += CheckApplyGpuLimits_Click;
+            panelApplyGpuLimits.Controls.Add(checkApplyGpuLimits);
+            panelGPU.Controls.Add(panelApplyGpuLimits);
+            panelGPU.Controls.SetChildIndex(panelApplyGpuLimits, panelGPU.Controls.GetChildIndex(panelGPUTemp) + 1);
 
             fanSensorControl = new FanSensorControl(this);
 
@@ -253,6 +315,8 @@ namespace GHelper
             comboPowerMode.ValueMember = "Key";
 
             FillModes(false);
+            gpuBaseRead = Program.acpi.ReadDecoded(AsusACPI.GPU_BASE);
+            RememberGpuPowerProbe(gpuBaseRead, default, null);
             InitAll();
             InitCPU();
 
@@ -298,9 +362,6 @@ namespace GHelper
             ToggleNavigation(0);
 
             if (!Program.acpi.IsSupported(AsusACPI.DevsCPUFanCurve)) buttonCalibrate.Visible = false;
-
-            gpuPowerBase = Program.acpi.DeviceGet(AsusACPI.GPU_BASE);
-            panelGPUPower.Visible = isGPUPower;
 
             FormClosed += Fans_FormClosed;
             Activated  += (_, _) => VisualiseAdvanced();
@@ -367,7 +428,8 @@ namespace GHelper
         private void CheckApplyUV_Click(object? sender, EventArgs e)
         {
             AppConfig.SetMode("auto_uv", checkApplyUV.Checked ? 1 : 0);
-            modeControl.AutoRyzen();
+            using (XgMitigation.Explicit(XgMitigation.UvApply))
+                modeControl.AutoRyzen();
         }
 
         public void InitAll()
@@ -436,7 +498,9 @@ namespace GHelper
 
         private void ButtonApplyAdvanced_Click(object? sender, EventArgs e)
         {
-            string result = modeControl.SetRyzen(true);
+            string result;
+            using (XgMitigation.Explicit(XgMitigation.UvApply))
+                result = modeControl.SetRyzen(true);
             checkApplyUV.Enabled = true;
             ShowLabelRisky(result);
         }
@@ -552,7 +616,8 @@ namespace GHelper
 
             Modes.Remove(mode);
             FillModes();
-            modeControl.SetPerformanceMode(AsusACPI.PerformanceBalanced);
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                modeControl.SetPerformanceMode(AsusACPI.PerformanceBalanced);
 
         }
 
@@ -569,7 +634,8 @@ namespace GHelper
         {
             int mode = Modes.Add();
             FillModes();
-            modeControl.SetPerformanceMode(mode);
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                modeControl.SetPerformanceMode(mode);
         }
 
         public void InitMode()
@@ -577,6 +643,194 @@ namespace GHelper
             int mode = Modes.GetCurrent();
             comboModes.SelectedValue = mode;
             buttonRename.Visible = buttonRemove.Visible = Modes.IsCurrentCustom();
+            ApplyXgLock();
+        }
+
+        public void ApplyXgLock()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(ApplyXgLock);
+                return;
+            }
+
+            var decision = CurrentGpuDecision();
+            bool locked = !decision.CpuTdpEnabled;
+            comboModes.Enabled = !locked;
+            buttonAdd.Enabled = !locked;
+            buttonRemove.Enabled = !locked && Modes.IsCurrentCustom();
+            trackTotal.Enabled = decision.CpuTdpEnabled;
+            buttonReset.Enabled = !locked;
+            trackSlow.Enabled = decision.CpuTdpEnabled;
+            trackFast.Enabled = decision.CpuTdpEnabled;
+            trackCPU.Enabled = decision.CpuTdpEnabled;
+            trackCPUTemp.Enabled = !locked;
+            checkApplyPower.Enabled = decision.CpuTdpEnabled;
+            if (locked)
+                panelGPUtoCPU.Visible = false;
+            ApplyGpuDecision(decision);
+        }
+
+        bool GpuLimitsWritable()
+        {
+            if (XgMitigation.Shared.Enabled)
+                return XgMitigation.Shared.GpuLimitsOpen();
+            return !Program.acpi.IsXGActive();
+        }
+
+        GpuControlPresentation.Decision CurrentGpuDecision()
+        {
+            bool mitigation = XgMitigation.Shared.Enabled;
+            XgDockSnapshot snap;
+            bool admissionClosed = false;
+            if (mitigation)
+            {
+                snap = XgMitigation.Shared.Peek();
+                admissionClosed = XgMitigation.Shared.AdmissionClosed;
+            }
+            else
+            {
+                snap = new XgDockSnapshot
+                {
+                    State = Program.acpi.IsXGActive() ? XgDockState.Active : XgDockState.Inactive,
+                    HasSample = true,
+                    Source = "legacy_active"
+                };
+            }
+            return GpuControlPresentation.Decide(
+                snap, admissionClosed, mitigation, gpuNvidiaPresent, gpuPowerCapability,
+                gpuBoostResponds, gpuTempResponds, gpuClockOffsetSupported,
+                gpuEco, gpuInitFault, GpuControlPresentation.BuildVersion);
+        }
+
+        void RememberGpuPowerProbe(DecodedRead gpuBase, DecodedRead gpuPower, int? measuredMax)
+        {
+            gpuBaseRead = gpuBase;
+            gpuPowerRead = gpuPower;
+            gpuMeasuredMax = measuredMax;
+            gpuPowerCapability = GpuPowerCapability.Evaluate(
+                gpuBase, gpuPower, measuredMax, NvidiaSmi.GetDefaultMaxGPUPower());
+            gpuPowerReady = gpuPowerCapability.RangeEstablished;
+            gpuPowerBase = gpuPowerCapability.BasePositive ? gpuBase.Decoded : 0;
+        }
+
+        void ApplyGpuDecision(GpuControlPresentation.Decision decision)
+        {
+            var bound = GpuControlPresentation.Bind(decision, (gpuPowerBase + trackGPUPower.Value) + "W");
+            trackGPUPower.Enabled = bound.PowerEnabled;
+            trackGPUBoost.Enabled = bound.BoostEnabled;
+            trackGPUTemp.Enabled = bound.TempEnabled;
+            panelGPUPower.Visible = bound.PowerRowVisible;
+            panelGPUBoost.Visible = bound.BoostRowVisible;
+            panelGPUTemp.Visible = bound.TempRowVisible;
+            panelGPUCore.Visible = bound.ClockOffsetVisible;
+            panelGPUMemory.Visible = bound.ClockOffsetVisible;
+            panelGPUClockLimit.Visible = bound.ClockLimitVisible;
+            labelGPUPower.Text = bound.PowerLabel;
+            gpuLimitPowerSupported = bound.PowerRowVisible;
+            gpuLimitBoostSupported = bound.BoostRowVisible;
+            gpuLimitTempSupported = bound.TempRowVisible;
+            gpuClockLimitSupported = bound.ClockLimitVisible;
+            if (labelGpuLimitLock is not null)
+            {
+                labelGpuLimitLock.Text = bound.Notice;
+                labelGpuLimitLock.Visible = bound.NoticeVisible;
+            }
+            loadingGpuApply = true;
+            checkApplyGpuLimits.Checked = AppConfig.IsApplyGpuPower();
+            checkApplyGpuLimits.Enabled = bound.PageVisible;
+            loadingGpuApply = false;
+            gpuVisible = buttonGPU.Visible = bound.PageVisible;
+            if (bound.Diagnostic != lastGpuDiagnostic)
+            {
+                lastGpuDiagnostic = bound.Diagnostic;
+                Logger.WriteLine(bound.Diagnostic);
+            }
+            if (!bound.PageVisible && panelGPU.Visible)
+                ToggleNavigation(0);
+        }
+
+        static void RestoreGpuKey(string key, int original)
+        {
+            if (original >= 0) AppConfig.SetMode(key, original);
+            else AppConfig.RemoveMode(key);
+        }
+
+        void RememberGpuGesture()
+        {
+            if (gpuGesture) return;
+            gestureBoost = AppConfig.GetMode("gpu_boost");
+            gestureTemp = AppConfig.GetMode("gpu_temp");
+            gesturePower = AppConfig.GetMode("gpu_power");
+            gpuGesture = true;
+        }
+
+        void CommitGpuDisplay()
+        {
+            committedBoost = trackGPUBoost.Value;
+            committedTemp = trackGPUTemp.Value;
+            committedPower = trackGPUPower.Value;
+            gpuDisplayCommitted = true;
+        }
+
+        int SavedGpuTrack(TrackBar track, string key, int committed)
+        {
+            int configured = AppConfig.GetMode(key);
+            int value = configured >= track.Minimum && configured <= track.Maximum
+                ? configured
+                : gpuDisplayCommitted ? committed : track.Value;
+            return Math.Max(Math.Min(value, track.Maximum), track.Minimum);
+        }
+
+        void ShowSavedGpuLimits(bool power, bool temp)
+        {
+            loadingGpuLimits = true;
+            try
+            {
+                if (power)
+                {
+                    trackGPUBoost.Value = SavedGpuTrack(trackGPUBoost, "gpu_boost", committedBoost);
+                    if (gpuPowerReady)
+                        trackGPUPower.Value = SavedGpuTrack(trackGPUPower, "gpu_power", committedPower);
+                }
+                if (temp)
+                    trackGPUTemp.Value = SavedGpuTrack(trackGPUTemp, "gpu_temp", committedTemp);
+            }
+            finally
+            {
+                loadingGpuLimits = false;
+            }
+            VisualiseGPUSettings();
+        }
+
+        void RestoreGpuGesture()
+        {
+            if (gpuGesture)
+            {
+                RestoreGpuKey("gpu_boost", gestureBoost);
+                RestoreGpuKey("gpu_temp", gestureTemp);
+                if (gpuPowerReady) RestoreGpuKey("gpu_power", gesturePower);
+                gpuGesture = false;
+            }
+            ShowSavedGpuLimits(true, true);
+            if (gpuDisplayCommitted) CommitGpuDisplay();
+        }
+
+        void RestoreDeniedGpuLimits(XgMitigation.GpuLimitApplyResult result)
+        {
+            if (gpuGesture)
+            {
+                if (result.PowerDenied)
+                {
+                    RestoreGpuKey("gpu_boost", gestureBoost);
+                    if (gpuPowerReady) RestoreGpuKey("gpu_power", gesturePower);
+                }
+                if (result.TempDenied)
+                    RestoreGpuKey("gpu_temp", gestureTemp);
+                gpuGesture = false;
+            }
+            ShowSavedGpuLimits(result.PowerDenied, result.TempDenied);
+            if (gpuDisplayCommitted) CommitGpuDisplay();
         }
 
         private void ComboModes_SelectedValueChanged(object? sender, EventArgs e)
@@ -588,44 +842,106 @@ namespace GHelper
 
             Debug.WriteLine(selectedMode);
 
-            modeControl.SetPerformanceMode((int)selectedMode);
+            bool applied;
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                applied = modeControl.SetPerformanceMode((int)selectedMode);
+            if (!applied)
+                comboModes.SelectedValue = Modes.GetCurrent();
         }
 
         private void TrackGPU_MouseUp(object? sender, MouseEventArgs e)
         {
-            modeControl.SetGPUPower();
+            if (!AppConfig.IsApplyGpuPower()) return;
+            if (GpuLimitsWritable())
+                ApplyGpuLimits(sender == trackGPUTemp ? XgOp.GpuThermal : XgOp.Power);
+        }
+
+        private void CheckApplyGpuLimits_Click(object? sender, EventArgs e)
+        {
+            if (loadingGpuApply) return;
+            AppConfig.SetMode("auto_apply_gpu", checkApplyGpuLimits.Checked ? 1 : 0);
+            if (!checkApplyGpuLimits.Checked) return;
+            if (GpuLimitsWritable())
+                ApplyGpuLimits(XgOp.Power | XgOp.GpuThermal);
+        }
+
+        void ApplyGpuLimits(XgOp op)
+        {
+            if (loadingGpuLimits) return;
+            if (!GpuLimitsWritable())
+            {
+                RestoreGpuGesture();
+                return;
+            }
+
+            RememberGpuGesture();
+            if (trackGPUBoost.Enabled) AppConfig.SetMode("gpu_boost", trackGPUBoost.Value);
+            if (trackGPUTemp.Enabled) AppConfig.SetMode("gpu_temp", trackGPUTemp.Value);
+            if (gpuPowerReady && trackGPUPower.Enabled) AppConfig.SetMode("gpu_power", trackGPUPower.Value);
+
+            XgMitigation.GpuLimitApplyResult result;
+            using (XgMitigation.Explicit(op))
+                result = modeControl.SetGPUPower();
+            if (result.Suppressed)
+                RestoreDeniedGpuLimits(result);
+            else
+            {
+                gpuGesture = false;
+                CommitGpuDisplay();
+            }
         }
 
         private void TrackGPUClocks_MouseUp(object? sender, MouseEventArgs e)
         {
-            modeControl.SetGPUClocks(true);
+            using (XgMitigation.Explicit(XgOp.Clocks))
+                modeControl.SetGPUClocks(true);
+        }
+
+        static void ShowPowerTrack(TrackBar track, int minimum, int maximum, int value)
+        {
+            int shown = Math.Max(Math.Min(value, maximum), minimum);
+            if (track.Maximum < shown) track.Maximum = shown;
+            if (track.Minimum > shown) track.Minimum = shown;
+            track.Value = shown;
+            track.Minimum = minimum;
+            track.Maximum = maximum;
         }
 
         private void InitGPUPower()
         {
-            if (!isGPUPower) return;
-
-            int maxGPUPower = NvidiaSmi.GetMaxGPUPower();
-            if (maxGPUPower > 0)
-            {
-                AsusACPI.MaxGPUPower = maxGPUPower - gpuPowerBase - AsusACPI.MaxGPUBoost;
-                trackGPUPower.Minimum = AsusACPI.MinGPUPower;
-                trackGPUPower.Maximum = AsusACPI.MaxGPUPower;
-            }
+            if (!gpuPowerReady || gpuPowerCapability.AdditionalMaximum is not int maximum) return;
+            int minimum = gpuPowerCapability.AdditionalMinimum ?? AsusACPI.MinGPUPower;
+            AsusACPI.MaxGPUPower = maximum;
 
             Task.Run(async () =>
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(200));
-                int gpuPowerVar = Program.acpi.DeviceGet(AsusACPI.GPU_POWER);
+                DecodedRead powerRead = Program.acpi.ReadDecoded(AsusACPI.GPU_POWER);
+                int gpuPowerVar = GpuPowerCapability.TransportOk(powerRead) ? powerRead.Decoded : -1;
                 Logger.WriteLine($"ReadGPUPower ({Modes.GetCurrentBase()}): {gpuPowerBase} + {gpuPowerVar}");
-
-                int gpu_power = AppConfig.GetMode("gpu_power");
-                if (gpu_power < 0) gpu_power = (gpuPowerVar >= 0) ? gpuPowerVar : AsusACPI.MaxGPUPower;
+                int saved = AppConfig.GetMode("gpu_power");
 
                 Invoke(delegate
                 {
-                    trackGPUPower.Value = Math.Max(Math.Min(gpu_power, AsusACPI.MaxGPUPower), AsusACPI.MinGPUPower);
-                    VisualiseGPUSettings();
+                    loadingGpuLimits = true;
+                    try
+                    {
+                        RememberGpuPowerProbe(gpuBaseRead, powerRead, gpuMeasuredMax);
+                        if (gpuPowerReady && gpuPowerCapability.AdditionalMaximum is int liveMaximum)
+                        {
+                            int liveMinimum = gpuPowerCapability.AdditionalMinimum ?? minimum;
+                            int gpu_power = saved >= liveMinimum && saved <= liveMaximum ? saved
+                                : gpuPowerVar >= liveMinimum && gpuPowerVar <= liveMaximum ? gpuPowerVar
+                                : liveMaximum;
+                            ShowPowerTrack(trackGPUPower, liveMinimum, liveMaximum, gpu_power);
+                            CommitGpuDisplay();
+                        }
+                    }
+                    finally
+                    {
+                        loadingGpuLimits = false;
+                    }
+                    ApplyXgLock();
                 });
             });
         }
@@ -634,86 +950,106 @@ namespace GHelper
         {
             Task.Run(() =>
             {
-                if (Program.acpi.DeviceGet(AsusACPI.GPUEco) == 1)
-                {
-                    Invoke(delegate { gpuVisible = buttonGPU.Visible = false; });
-                    return;
-                }
-
-                if (HardwareControl.GpuControl is null || !HardwareControl.GpuControl.IsValid) HardwareControl.RecreateGpuControl();
-
-                if (HardwareControl.GpuControl is not NvidiaGpuControl nv)
-                {
-                    Invoke(delegate { gpuVisible = buttonGPU.Visible = false; });
-                    return;
-                }
-
-                nvControl = nv;
-
+                bool eco = false;
+                bool havePowerProbe = false;
+                DecodedRead gpuBase = default;
+                DecodedRead gpuPower = default;
+                int? measured = null;
+                bool boostResponds = false;
+                bool tempResponds = false;
+                bool nvidia = false;
+                NvidiaGpuControl? nv = null;
+                string? gpuName = null;
+                int gpu_boost = AsusACPI.MaxGPUBoost;
+                int gpu_temp = AsusACPI.MaxGPUTemp;
+                int core = 0;
+                int memory = 0;
+                int clock_limit = NvidiaGpuControl.MaxClockLimit;
+                string? fault = null;
                 try
                 {
-                    int gpu_boost = AppConfig.GetMode("gpu_boost");
-                    int gpu_temp = AppConfig.GetMode("gpu_temp");
-
-                    int core = AppConfig.GetMode("gpu_core");
-                    int memory = AppConfig.GetMode("gpu_memory");
-                    int clock_limit = AppConfig.GetMode("gpu_clock_limit");
-
+                    eco = Program.acpi.DeviceGet(AsusACPI.GPUEco) == 1;
+                    gpuBase = Program.acpi.ReadDecoded(AsusACPI.GPU_BASE);
+                    gpuPower = Program.acpi.ReadDecoded(AsusACPI.GPU_POWER);
+                    measured = NvidiaSmi.TryReadReportedMaxGpuPower(out int smiMax) ? smiMax : null;
+                    boostResponds = Program.acpi.DeviceGet(AsusACPI.PPT_GPUC0) >= 0;
+                    tempResponds = Program.acpi.DeviceGet(AsusACPI.PPT_GPUC2) >= 0;
+                    havePowerProbe = true;
+                    gpu_boost = AppConfig.GetMode("gpu_boost");
+                    gpu_temp = AppConfig.GetMode("gpu_temp");
                     if (gpu_boost < 0) gpu_boost = AsusACPI.MaxGPUBoost;
                     if (gpu_temp < 0) gpu_temp = AsusACPI.MaxGPUTemp;
 
+                    if (HardwareControl.GpuControl is null || !HardwareControl.GpuControl.IsValid) HardwareControl.RecreateGpuControl();
+                    nv = HardwareControl.GpuControl as NvidiaGpuControl;
+                    nvidia = nv is { IsValid: true };
+                    core = AppConfig.GetMode("gpu_core");
+                    memory = AppConfig.GetMode("gpu_memory");
+                    clock_limit = AppConfig.GetMode("gpu_clock_limit");
                     if (core == -1) core = 0;
                     if (memory == -1) memory = 0;
                     if (clock_limit == -1) clock_limit = NvidiaGpuControl.MaxClockLimit;
-
-                    string? gpuName = null;
-
-                    if (nvControl is not null)
+                    if (nvidia && nv is not null)
                     {
-                        if (nvControl.GetClocks(out int current_core, out int current_memory))
+                        nvControl = nv;
+                        if (nv.GetClocks(out int current_core, out int current_memory))
                         {
                             core = current_core;
                             memory = current_memory;
                         }
-
-                        int _clockLimit = nvControl.GetMaxGPUCLock();
-
-                        if (_clockLimit == 0) clock_limit = NvidiaGpuControl.MaxClockLimit;
-                        else if (_clockLimit > 0) clock_limit = _clockLimit;
-
-                        try { gpuName = nvControl.FullName; } catch { }
+                        int clockRead = nv.GetMaxGPUCLock();
+                        if (clockRead == 0) clock_limit = NvidiaGpuControl.MaxClockLimit;
+                        else if (clockRead > 0) clock_limit = clockRead;
+                        try { gpuName = nv.FullName; } catch { }
                     }
-
-                    bool boostVisible = Program.acpi.IsSupported(AsusACPI.PPT_GPUC0);
-                    bool tempVisible = Program.acpi.IsSupported(AsusACPI.PPT_GPUC2);
-
-                    Invoke(delegate
-                    {
-                        gpuVisible = buttonGPU.Visible = true;
-                        if (gpuName is not null) labelGPU.Text = gpuName;
-
-                        trackGPUClockLimit.Value = Math.Max(Math.Min(clock_limit, NvidiaGpuControl.MaxClockLimit), NvidiaGpuControl.MinClockLimit);
-
-                        trackGPUCore.Value = Math.Max(Math.Min(core, NvidiaGpuControl.MaxCoreOffset), NvidiaGpuControl.MinCoreOffset);
-                        trackGPUMemory.Value = Math.Max(Math.Min(memory, NvidiaGpuControl.MaxMemoryOffset), NvidiaGpuControl.MinMemoryOffset);
-
-                        trackGPUBoost.Value = Math.Max(Math.Min(gpu_boost, AsusACPI.MaxGPUBoost), AsusACPI.MinGPUBoost);
-                        trackGPUTemp.Value = Math.Max(Math.Min(gpu_temp, AsusACPI.MaxGPUTemp), AsusACPI.MinGPUTemp);
-
-                        panelGPUBoost.Visible = boostVisible;
-                        panelGPUTemp.Visible = tempVisible;
-                        panelGPUCore.Visible = panelGPUMemory.Visible = nv.IsClockOffsetSupported;
-
-                        VisualiseGPUSettings();
-
-                        InitGPUPower();
-                    });
                 }
                 catch (Exception ex)
                 {
+                    fault = ex.GetType().Name;
                     Logger.WriteLine(ex.ToString());
-                    try { Invoke(delegate { gpuVisible = buttonGPU.Visible = false; }); } catch { }
                 }
+
+                try
+                {
+                    Invoke(delegate
+                    {
+                        loadingGpuLimits = true;
+                        try
+                        {
+                            gpuInitFault = fault;
+                            gpuEco = eco;
+                            gpuNvidiaPresent = nvidia;
+                            gpuBoostResponds = boostResponds;
+                            gpuTempResponds = tempResponds;
+                            gpuClockOffsetSupported = nvidia && nv is { IsClockOffsetSupported: true };
+                            if (havePowerProbe) RememberGpuPowerProbe(gpuBase, gpuPower, measured);
+                            if (gpuName is not null) labelGPU.Text = gpuName;
+
+                            if (nvidia)
+                            {
+                                trackGPUClockLimit.Value = Math.Max(Math.Min(clock_limit, NvidiaGpuControl.MaxClockLimit), NvidiaGpuControl.MinClockLimit);
+                                trackGPUCore.Value = Math.Max(Math.Min(core, NvidiaGpuControl.MaxCoreOffset), NvidiaGpuControl.MinCoreOffset);
+                                trackGPUMemory.Value = Math.Max(Math.Min(memory, NvidiaGpuControl.MaxMemoryOffset), NvidiaGpuControl.MinMemoryOffset);
+                            }
+                            if (boostResponds)
+                                trackGPUBoost.Value = Math.Max(Math.Min(gpu_boost, AsusACPI.MaxGPUBoost), AsusACPI.MinGPUBoost);
+                            if (tempResponds)
+                                trackGPUTemp.Value = Math.Max(Math.Min(gpu_temp, AsusACPI.MaxGPUTemp), AsusACPI.MinGPUTemp);
+                            if (gpuPowerReady && gpuPowerCapability.AdditionalMaximum is int maximum)
+                                ShowPowerTrack(trackGPUPower, gpuPowerCapability.AdditionalMinimum ?? AsusACPI.MinGPUPower, maximum, maximum);
+
+                            VisualiseGPUSettings();
+                            CommitGpuDisplay();
+                            InitGPUPower();
+                        }
+                        finally
+                        {
+                            loadingGpuLimits = false;
+                        }
+                        ApplyXgLock();
+                    });
+                }
+                catch { }
             });
         }
 
@@ -730,7 +1066,9 @@ namespace GHelper
             else
                 labelGPUClockLimit.Text = $"{trackGPUClockLimit.Value} MHz";
 
-            labelGPUPower.Text = (gpuPowerBase + trackGPUPower.Value) + "W";
+            labelGPUPower.Text = gpuPowerReady
+                ? (gpuPowerBase + trackGPUPower.Value) + "W"
+                : GpuControlPresentation.WattUnavailableLabel;
 
         }
 
@@ -803,10 +1141,22 @@ namespace GHelper
 
         private void trackGPUPower_Scroll(object? sender, EventArgs e)
         {
+            if (loadingGpuLimits)
+            {
+                VisualiseGPUSettings();
+                return;
+            }
+            if (!GpuLimitsWritable())
+            {
+                RestoreGpuGesture();
+                return;
+            }
+
+            RememberGpuGesture();
             AppConfig.SetMode("gpu_boost", trackGPUBoost.Value);
             AppConfig.SetMode("gpu_temp", trackGPUTemp.Value);
 
-            if (isGPUPower) AppConfig.SetMode("gpu_power", trackGPUPower.Value);
+            if (gpuPowerReady) AppConfig.SetMode("gpu_power", trackGPUPower.Value);
 
             VisualiseGPUSettings();
         }
@@ -919,18 +1269,22 @@ namespace GHelper
 
         private void TrackPower_MouseUp(object? sender, MouseEventArgs e)
         {
+            XgOp op = sender == trackCPUTemp ? XgOp.CpuLimit : XgOp.Power;
             Task.Run(() =>
             {
-                modeControl.AutoPower(true);
+                using (XgMitigation.Explicit(op))
+                    modeControl.AutoPower(true);
             });
         }
 
 
         private void TrackPower_KeyUp(object? sender, KeyEventArgs e)
         {
+            XgOp op = sender == trackCPUTemp ? XgOp.CpuLimit : XgOp.Power;
             Task.Run(() =>
             {
-                modeControl.AutoPower(true);
+                using (XgMitigation.Explicit(op))
+                    modeControl.AutoPower(true);
             });
         }
 
@@ -967,7 +1321,7 @@ namespace GHelper
         {
             if (AppConfig.GetMode("auto_boost") != comboBoost.SelectedIndex)
             {
-                PowerNative.SetCPUBoost(comboBoost.SelectedIndex);
+                XgMitigation.Shared.RunCpuBoost("ComboBoost", () => PowerNative.SetCPUBoost(comboBoost.SelectedIndex));
             }
             AppConfig.SetMode("auto_boost", comboBoost.SelectedIndex);
         }
@@ -978,7 +1332,8 @@ namespace GHelper
             CheckBox chk = (CheckBox)sender;
 
             AppConfig.SetMode("auto_apply_power", chk.Checked ? 1 : 0);
-            modeControl.SetPerformanceMode();
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                modeControl.SetPerformanceMode();
 
         }
 
@@ -988,6 +1343,7 @@ namespace GHelper
             CheckBox chk = (CheckBox)sender;
 
             AppConfig.SetMode("auto_apply", chk.Checked ? 1 : 0);
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
             modeControl.SetPerformanceMode();
 
         }
@@ -1037,7 +1393,7 @@ namespace GHelper
             panelCPU.Visible = modeB0;
 
             panelCrossLoad.Visible = modeCross;
-            panelGPUtoCPU.Visible = modeGPUtoCPU;
+            panelGPUtoCPU.Visible = modeGPUtoCPU && !Program.acpi.IsXGActive();
             panelCPUTemp.Visible = modeCPUTemp;
 
             panelApplyPower.Visible = panelTitleCPU.Visible = modeA || modeB0 || modeC1;
@@ -1305,6 +1661,7 @@ namespace GHelper
 
         private void ButtonReset_Click(object? sender, EventArgs e)
         {
+            using var explicitReset = XgMitigation.Explicit(XgMitigation.ResetApply);
 
             LoadProfile(seriesCPU, AsusFan.CPU, true);
             LoadProfile(seriesGPU, AsusFan.GPU, true);
@@ -1395,7 +1752,8 @@ namespace GHelper
             if (AppConfig.Is("xgm_fan"))
                 SaveProfile(seriesXGM, AsusFan.XGM);
 
-            modeControl.AutoFans();
+            using (XgMitigation.Explicit(XgOp.Fan))
+                modeControl.AutoFans();
         }
 
         private void ChartCPU_MouseUp(object? sender, MouseEventArgs e)

@@ -105,7 +105,8 @@ namespace GHelper.Mode
         {
             ResetRyzen();
 
-            Program.acpi.SetPerformanceMode(Modes.GetCurrentBase());
+            int status = Program.acpi.SetPerformanceMode(Modes.GetCurrentBase());
+            if (status == XgMitigation.Suppressed) return;
 
             // Default power mode
             AppConfig.RemoveMode("powermode");
@@ -117,8 +118,22 @@ namespace GHelper.Mode
             Program.toast.RunToast(Modes.GetCurrentName(), SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Online ? ToastIcon.Charger : ToastIcon.Battery);
         }
 
-        public void SetPerformanceMode(int mode = -1, bool notify = false)
+        public bool SetPerformanceMode(int mode = -1, bool notify = false)
         {
+            using (var lease = XgMitigation.Shared.Enter("SetPerformanceMode", "DEVS", XgOp.Profile))
+            {
+                if (!lease.Allowed)
+                {
+                    settings.ShowMode(Modes.GetCurrent());
+                    return false;
+                }
+                if (!lease.Enforced && Program.acpi.IsXGActive())
+                {
+                    Logger.WriteLine("XG Mobile is active. Performance profile was not written.");
+                    settings.ShowMode(Modes.GetCurrent());
+                    return false;
+                }
+            }
 
             int oldMode = Modes.GetCurrent();
             if (mode < 0) mode = oldMode;
@@ -201,6 +216,7 @@ namespace GHelper.Mode
                     PowerNative.SetCPUBoost(AppConfig.GetMode("auto_boost"));
 
             settings.FansInit();
+            return true;
         }
 
 
@@ -208,7 +224,8 @@ namespace GHelper.Mode
         {
             modeToggleTimer.Stop();
             Logger.WriteLine($"Hotkey mode: {Modes.GetCurrent()}");
-            SetPerformanceMode();
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                SetPerformanceMode();
 
         }
 
@@ -236,33 +253,43 @@ namespace GHelper.Mode
             {
 
                 bool xgmFan = false;
-                if (AppConfig.Is("xgm_fan"))
+                bool xgmActive = Program.acpi.IsXGActive();
+                if (xgmActive || AppConfig.Is("xgm_fan"))
                 {
-                    XGM.SetFan(AppConfig.GetFanConfig(AsusFan.XGM));
-                    xgmFan = Program.acpi.IsXGConnected();
+                    byte[] xgmCurve = AppConfig.GetFanConfig(AsusFan.XGM);
+                    if (AppConfig.Is("xgm_fan") && !AsusACPI.IsInvalidCurve(xgmCurve))
+                        XGM.SetFan(xgmCurve);
+                    else if (xgmActive)
+                        XGM.Reset();
+
+                    if (!xgmActive)
+                        xgmFan = Program.acpi.IsXGConnected();
                 }
 
+                using var fanLease = XgMitigation.Shared.Enter("AutoFans", "DEVS", XgOp.Fan);
+                if (fanLease.Allowed)
+                {
                 int cpuResult = Program.acpi.SetFanCurve(AsusFan.CPU, AppConfig.GetFanConfig(AsusFan.CPU));
-                int gpuResult = Program.acpi.SetFanCurve(AsusFan.GPU, AppConfig.GetFanConfig(AsusFan.GPU));
+                int gpuResult = xgmActive ? 1 : Program.acpi.SetFanCurve(AsusFan.GPU, AppConfig.GetFanConfig(AsusFan.GPU));
 
                 if (AppConfig.Is("mid_fan"))
                     Program.acpi.SetFanCurve(AsusFan.Mid, AppConfig.GetFanConfig(AsusFan.Mid));
 
 
                 // Alternative way to set fan curve
-                if (cpuResult != 1 || gpuResult != 1)
+                if (XgMitigation.FanFallbackIsHardwareRejection(cpuResult, gpuResult))
                 {
                     cpuResult = Program.acpi.SetFanRange(AsusFan.CPU, AppConfig.GetFanConfig(AsusFan.CPU));
-                    gpuResult = Program.acpi.SetFanRange(AsusFan.GPU, AppConfig.GetFanConfig(AsusFan.GPU));
+                    gpuResult = xgmActive ? 1 : Program.acpi.SetFanRange(AsusFan.GPU, AppConfig.GetFanConfig(AsusFan.GPU));
 
                     // Something went wrong, resetting to default profile
-                    if (cpuResult != 1 || gpuResult != 1)
+                    if (XgMitigation.FanFallbackIsHardwareRejection(cpuResult, gpuResult))
                     {
                         Program.acpi.DeviceSet(AsusACPI.PerformanceMode, Modes.GetCurrentBase(), "Reset Mode");
                         settings.LabelFansResult("Model doesn't support custom fan curves");
                     }
                 }
-                else
+                else if (cpuResult == 1 && gpuResult == 1)
                 {
                     settings.LabelFansResult("");
                     customFans = true;
@@ -274,7 +301,7 @@ namespace GHelper.Mode
                     Program.acpi.SetFanHysteresis(hystUp, hystDown);
 
                 // force set PPTs for missbehaving bios on FX507/517 series
-                if ((AppConfig.IsPowerRequired() || xgmFan) && !AppConfig.IsApplyPower())
+                if (!xgmActive && (AppConfig.IsPowerRequired() || xgmFan) && !AppConfig.IsApplyPower())
                 {
                     Task.Run(async () =>
                     {
@@ -282,6 +309,7 @@ namespace GHelper.Mode
                         Program.acpi.DeviceSet(AsusACPI.PPT_APUA0, 80, "PowerLimit Fix A0");
                         Program.acpi.DeviceSet(AsusACPI.PPT_APUA3, 80, "PowerLimit Fix A3");
                     });
+                }
                 }
 
             } else
@@ -295,9 +323,6 @@ namespace GHelper.Mode
 
         public void AutoPower(bool launchAsAdmin = false)
         {
-
-            customPower = 0;
-
             bool applyPower = AppConfig.IsApplyPower();
             bool applyFans = AppConfig.IsApplyFans();
 
@@ -310,7 +335,7 @@ namespace GHelper.Mode
             if (applyPower) SetPower(launchAsAdmin);
 
             Thread.Sleep(500);
-            SetGPUPower();
+            if (AppConfig.IsApplyGpuPower()) SetGPUPower();
             if (applyPower) SetCrossPower();
             AutoRyzen();
 
@@ -331,9 +356,6 @@ namespace GHelper.Mode
             if (!_ryzenPower) return;
             if (!AppConfig.IsApplyPower()) return;
 
-            var smu = GetSmu();
-            if (smu == null) return;
-
             int limit_total = AppConfig.GetMode("limit_total");
             int limit_slow = AppConfig.GetMode("limit_slow", limit_total);
             int limit_fast = AppConfig.GetMode("limit_fast", limit_slow);
@@ -341,13 +363,27 @@ namespace GHelper.Mode
             if (limit_total > AsusACPI.MaxTotal) return;
             if (limit_total < AsusACPI.MinTotal) return;
 
+            using var ryzenLease = XgMitigation.Shared.Enter("SetRyzenPower", "SMU.SetAllLimits", XgOp.Power);
+            if (!ryzenLease.Allowed) return;
+            if (!ryzenLease.Enforced && Program.acpi.IsXGActive()) return;
+
+            var smu = GetSmu();
+            if (smu == null) return;
+
             smu.SetAllLimits(limit_total, limit_fast, limit_slow,
                 out SmuStatus stapm, out SmuStatus fast, out SmuStatus slow);
+            if (ryzenLease.Enforced)
+                XgMitigation.Shared.LogCompleted(ryzenLease, "SetRyzenPower", "SMU.SetAllLimits", $"{limit_total}/{limit_fast}/{limit_slow}", $"{stapm}/{fast}/{slow}");
             if (init) Logger.WriteLine($"STAPM: {limit_total}W {stapm} | SLOW: {limit_slow}W {slow} | FAST: {limit_fast}W {fast}");
         }
 
         public void SetPower(bool launchAsAdmin = false)
         {
+            if (!XgMitigation.Shared.Enabled && Program.acpi.IsXGActive())
+            {
+                Logger.WriteLine("XG Mobile is active. CPU power limit was not written.");
+                return;
+            }
 
             bool allAMD = Program.acpi.IsAllAmdPPT();
             bool isAMD = CpuInfo.IsAMD;
@@ -371,12 +407,15 @@ namespace GHelper.Mode
             if (limit_slow > AsusACPI.MaxTotal) return;
             if (limit_slow < AsusACPI.MinTotal) return;
 
-            // SPL and SPPT
+            // SPL and SPPT. A3, A0, and the optional B0/C1 write share one admission.
             if (Program.acpi.IsSupported(AsusACPI.PPT_APUA0))
             {
-                Program.acpi.DeviceSet(AsusACPI.PPT_APUA3, limit_total, "PowerLimit A3");
-                Program.acpi.DeviceSet(AsusACPI.PPT_APUA0, limit_slow, "PowerLimit A0");
-                customPower = limit_total;
+                bool writeFast = !allAMD && isAMD && Program.acpi.IsSupported(AsusACPI.PPT_APUC1);
+                int written = XgMitigation.Shared.ApplyCpuPowerWrites(
+                    limit_total, limit_slow, allAMD, limit_cpu, writeFast, limit_fast,
+                    (id, value, name) => Program.acpi.DeviceSet(id, value, name));
+                if (written == XgMitigation.Suppressed) return;
+                customPower = allAMD ? limit_cpu : limit_total;
             }
             else if (isAMD)
             {
@@ -389,16 +428,16 @@ namespace GHelper.Mode
                     ProcessHelper.RunAsAdmin("cpu");
                     return;
                 }
-            }
 
-            if (allAMD) // CPU limit all amd models
-            {
-                Program.acpi.DeviceSet(AsusACPI.PPT_CPUB0, limit_cpu, "PowerLimit B0");
-                customPower = limit_cpu;
-            }
-            else if (isAMD && Program.acpi.IsSupported(AsusACPI.PPT_APUC1)) // FPPT boost for non all-amd models
-            {
-                Program.acpi.DeviceSet(AsusACPI.PPT_APUC1, limit_fast, "PowerLimit C1");
+                if (allAMD)
+                {
+                    int cpuResult = Program.acpi.DeviceSet(AsusACPI.PPT_CPUB0, limit_cpu, "PowerLimit B0");
+                    if (cpuResult != XgMitigation.Suppressed) customPower = limit_cpu;
+                }
+                else if (Program.acpi.IsSupported(AsusACPI.PPT_APUC1))
+                {
+                    Program.acpi.DeviceSet(AsusACPI.PPT_APUC1, limit_fast, "PowerLimit C1");
+                }
             }
 
             SetModeLabel();
@@ -407,6 +446,12 @@ namespace GHelper.Mode
 
         public void SetCrossPower()
         {
+            if (!XgMitigation.Shared.Enabled && Program.acpi.IsXGActive())
+            {
+                Logger.WriteLine("XG Mobile is active. CPU power limit was not written.");
+                return;
+            }
+
             int gpucpu = AppConfig.GetMode("limit_gpucpu");
             int crossload = AppConfig.GetMode("limit_crossload");
             int cputemp = AppConfig.GetMode("limit_cputemp");
@@ -423,8 +468,19 @@ namespace GHelper.Mode
 
         public void SetGPUClocks(bool launchAsAdmin = true, bool reset = false)
         {
+            bool enforced = XgMitigation.Shared.Enabled;
+            if (!enforced && Program.acpi.IsXGActive())
+            {
+                Logger.WriteLine("XG Mobile is active. GPU clocks were not written.");
+                return;
+            }
+
             Task.Run(() =>
             {
+                using var clockLease = enforced
+                    ? XgMitigation.Shared.Enter("SetGPUClocks", "NvAPI", XgOp.Clocks)
+                    : XgMitigation.Lease.Bypass();
+                if (!clockLease.Allowed) return;
 
                 int core = AppConfig.GetMode("gpu_core");
                 int memory = AppConfig.GetMode("gpu_memory");
@@ -444,10 +500,14 @@ namespace GHelper.Mode
                 {
                     int statusClocks = nvControl.SetClocks(core, memory);
                     int statusLimit = nvControl.SetMaxGPUClock(clock_limit);
+                    if (enforced)
+                        XgMitigation.Shared.LogCompleted(clockLease, "SetGPUClocks", "NvAPI", "clocks", $"clocks={statusClocks} limit={statusLimit}");
                     if ((statusLimit != 0 || statusClocks != 0) && launchAsAdmin) ProcessHelper.RunAsAdmin("gpu");
                 }
                 catch (Exception ex)
                 {
+                    if (enforced)
+                        XgMitigation.Shared.LogFailed(clockLease, "SetGPUClocks", "NvAPI", "clocks", ex.GetType().Name);
                     Logger.WriteLine("Clocks Error:" + ex.ToString());
                 }
 
@@ -455,28 +515,32 @@ namespace GHelper.Mode
             });
         }
 
-        public void SetGPUPower()
+        public XgMitigation.GpuLimitApplyResult SetGPUPower()
         {
+            if (!XgMitigation.Shared.Enabled && Program.acpi.IsXGActive())
+            {
+                Logger.WriteLine("XG Mobile is active. GPU power and temperature were not written.");
+                return new XgMitigation.GpuLimitApplyResult(true, 0) { PowerDenied = true, TempDenied = true };
+            }
 
             int gpu_boost = AppConfig.GetMode("gpu_boost");
             int gpu_temp = AppConfig.GetMode("gpu_temp");
             int gpu_power = AppConfig.GetMode("gpu_power");
+            // A fresh read. IsSupported keeps the first miss for the process, including a read from before this endpoint answers.
+            bool writePower = GpuPowerLimit.PowerInRange(gpu_power) && Program.acpi.ReadDecoded(AsusACPI.GPU_POWER).Decoded >= 0;
+            bool writeBoost = GpuPowerLimit.BoostInRange(gpu_boost) && Program.acpi.ReadDecoded(AsusACPI.PPT_GPUC0).Decoded >= 0;
+            bool writeTemp = GpuPowerLimit.TempInRange(gpu_temp) && Program.acpi.ReadDecoded(AsusACPI.PPT_GPUC2).Decoded >= 0;
+            if (GpuPowerLimit.PowerInRange(gpu_power) && !writePower)
+                Logger.WriteLine("GPU_POWER did not answer. The power slider was not written.");
 
-            int boostResult = -1;
-
-            if (gpu_power >= AsusACPI.MinGPUPower && gpu_power <= AsusACPI.MaxGPUPower && Program.acpi.IsSupported(AsusACPI.GPU_POWER))
-                Program.acpi.DeviceSet(AsusACPI.GPU_POWER, gpu_power, "PowerLimit TGP (GPU VAR)");
-
-            if (gpu_boost >= AsusACPI.MinGPUBoost && gpu_boost <= AsusACPI.MaxGPUBoost && Program.acpi.IsSupported(AsusACPI.PPT_GPUC0))
-                boostResult = Program.acpi.DeviceSet(AsusACPI.PPT_GPUC0, gpu_boost, "PowerLimit C0 (GPU BOOST)");
-
-            if (gpu_temp >= AsusACPI.MinGPUTemp && gpu_temp <= AsusACPI.MaxGPUTemp && Program.acpi.IsSupported(AsusACPI.PPT_GPUC2))
-                Program.acpi.DeviceSet(AsusACPI.PPT_GPUC2, gpu_temp, "PowerLimit C2 (GPU TEMP)");
-
-            // Fallback
-            if (boostResult == 0)
-                Program.acpi.DeviceSet(AsusACPI.PPT_GPUC0, gpu_boost, "PowerLimit C0");
-
+            var result = XgMitigation.Shared.ApplySupportedGpuLimits(
+                writePower, gpu_power,
+                writeBoost, gpu_boost,
+                writeTemp, gpu_temp,
+                (device, value, name) => Program.acpi.DeviceSet(device, value, name));
+            if (result.Suppressed && result.Writes == 0)
+                Logger.WriteLine("GPU power and temperature were not written. " + XgMitigation.GpuLimitsLockedText);
+            return result;
         }
 
         public SmuStatus? SetCPUTemp(int cpuTemp, bool log = false)
@@ -484,9 +548,14 @@ namespace GHelper.Mode
             if (cpuTemp < CpuInfo.MinTemp || cpuTemp > CpuInfo.DefaultTemp) return null;
             if (cpuTemp == CpuInfo.DefaultTemp && _cpuTemp == CpuInfo.DefaultTemp) return null;
 
+            using var tempLease = XgMitigation.Shared.Enter("SetCPUTemp", "SMU.SetThm", XgOp.Thermal);
+            if (!tempLease.Allowed) return null;
+
             var smu = GetSmu();
             if (smu == null) return null;
             SmuStatus status = smu.SetThm(cpuTemp);
+            if (tempLease.Enforced)
+                XgMitigation.Shared.LogCompleted(tempLease, "SetCPUTemp", "SMU.SetThm", cpuTemp.ToString(), status.ToString());
             if (log) Logger.WriteLine($"CPU Temp: {cpuTemp}°C {status}");
             if (status == SmuStatus.OK) _cpuTemp = cpuTemp;
             return status;
@@ -495,29 +564,35 @@ namespace GHelper.Mode
         public void SetUV(int cpuUV)
         {
             if (!CpuInfo.IsSupportedUV()) return;
+            if (cpuUV < CpuInfo.MinCPUUV || cpuUV > CpuInfo.MaxCPUUV) return;
 
-            if (cpuUV >= CpuInfo.MinCPUUV && cpuUV <= CpuInfo.MaxCPUUV)
-            {
-                var smu = GetSmu();
-                if (smu == null) return;
-                SmuStatus status = smu.SetCoAll(cpuUV);
-                Logger.WriteLine($"UV: {cpuUV} {status}");
-                if (status == SmuStatus.OK) _cpuUV = cpuUV;
-            }
+            using var lease = XgMitigation.Shared.Enter("SetUV", "SMU.SetCoAll", XgOp.Uv);
+            if (!lease.Allowed) return;
+
+            var smu = GetSmu();
+            if (smu == null) return;
+            SmuStatus status = smu.SetCoAll(cpuUV);
+            if (lease.Enforced)
+                XgMitigation.Shared.LogCompleted(lease, "SetUV", "SMU.SetCoAll", cpuUV.ToString(), status.ToString());
+            Logger.WriteLine($"UV: {cpuUV} {status}");
+            if (status == SmuStatus.OK) _cpuUV = cpuUV;
         }
 
         public void SetUViGPU(int igpuUV)
         {
             if (!CpuInfo.IsSupportedUViGPU()) return;
+            if (igpuUV < CpuInfo.MinIGPUUV || igpuUV > CpuInfo.MaxIGPUUV) return;
 
-            if (igpuUV >= CpuInfo.MinIGPUUV && igpuUV <= CpuInfo.MaxIGPUUV)
-            {
-                var smu = GetSmu();
-                if (smu == null) return;
-                SmuStatus status = smu.SetCoGfx(igpuUV);
-                Logger.WriteLine($"iGPU UV: {igpuUV} {status}");
-                if (status == SmuStatus.OK) _igpuUV = igpuUV;
-            }
+            using var lease = XgMitigation.Shared.Enter("SetUViGPU", "SMU.SetCoGfx", XgOp.Uv);
+            if (!lease.Allowed) return;
+
+            var smu = GetSmu();
+            if (smu == null) return;
+            SmuStatus status = smu.SetCoGfx(igpuUV);
+            if (lease.Enforced)
+                XgMitigation.Shared.LogCompleted(lease, "SetUViGPU", "SMU.SetCoGfx", igpuUV.ToString(), status.ToString());
+            Logger.WriteLine($"iGPU UV: {igpuUV} {status}");
+            if (status == SmuStatus.OK) _igpuUV = igpuUV;
         }
 
         public string SetRyzen(bool launchAsAdmin = false)
@@ -528,15 +603,19 @@ namespace GHelper.Mode
                 return string.Empty;
             }
 
-            var smu = GetSmu();
-            if (smu == null) return string.Empty;
-
             var lines = new System.Text.StringBuilder();
+            int cpuTemp = AppConfig.GetMode("cpu_temp");
+            using (var uvLease = XgMitigation.Shared.Enter("SetRyzen", "SMU.SetCo", XgOp.Uv))
+            {
+            if (uvLease.Allowed)
+            {
+            var smu = GetSmu();
+            if (smu != null)
+            {
             try
             {
                 int cpuUV   = AppConfig.GetMode("cpu_uv",   0);
                 int igpuUV  = AppConfig.GetMode("igpu_uv",  0);
-                int cpuTemp = AppConfig.GetMode("cpu_temp");
                 string? cpuUVCores = AppConfig.GetModeString("cpu_uv_cores");
 
                 if (CpuInfo.IsSupportedUV() && cpuUVCores is not null)
@@ -569,7 +648,20 @@ namespace GHelper.Mode
                     if (s == SmuStatus.OK) _igpuUV = igpuUV;
                     lines.AppendLine($"iGPU UV {igpuUV}: {s}");
                 }
+            }
+            catch (Exception ex)
+            {
+                Logger.WriteLine("UV Error: " + ex.ToString());
+            }
 
+            if (uvLease.Enforced)
+                XgMitigation.Shared.LogCompleted(uvLease, "SetRyzen", "SMU.SetCo", "curve", lines.ToString());
+            }
+            }
+            }
+
+            try
+            {
                 SmuStatus? tempStatus = SetCPUTemp(cpuTemp, true);
                 if (tempStatus.HasValue) lines.AppendLine($"CPU Temp {cpuTemp}°C: {tempStatus}");
             }

@@ -313,35 +313,60 @@ namespace GHelper.Gpu
 
                     if (silent)
                     {
-                        Program.acpi.DeviceSet(AsusACPI.GPUXG, 0, "GPU XGM");
-                        await Task.Delay(TimeSpan.FromSeconds(15));
+                        XgMitigation.Shared.EnterTransition("GPUXG eject");
+                        try
+                        {
+                            Program.acpi.DeviceSet(AsusACPI.GPUXG, 0, "GPU XGM");
+                            await Task.Delay(TimeSpan.FromSeconds(15));
+                        }
+                        finally
+                        {
+                            XgMitigation.Shared.ExitTransition("GPUXG eject");
+                            settings.fansForm?.ApplyXgLock();
+                        }
                     }
                     else
                     {
                         DialogResult dialogResult = settings.ShowMessage("Did you close all applications running on XG Mobile?", "Disabling XG Mobile", MessageBoxButtons.YesNo);
                         if (dialogResult == DialogResult.Yes)
                         {
-                            Program.acpi.DeviceSet(AsusACPI.GPUXG, 0, "GPU XGM");
-                            await Task.Delay(TimeSpan.FromSeconds(15));
-                            HardwareControl.RecreateGpuControl();
+                            XgMitigation.Shared.EnterTransition("GPUXG eject");
+                            try
+                            {
+                                Program.acpi.DeviceSet(AsusACPI.GPUXG, 0, "GPU XGM");
+                                await Task.Delay(TimeSpan.FromSeconds(15));
+                                HardwareControl.RecreateGpuControl();
+                            }
+                            finally
+                            {
+                                XgMitigation.Shared.ExitTransition("GPUXG eject");
+                                settings.fansForm?.ApplyXgLock();
+                            }
                         }
                     }
                 }
                 else
                 {
-
-                    if (AppConfig.Is("xgm_special"))
-                        Program.acpi.DeviceSet(AsusACPI.GPUXG, 0x101, "GPU XGM");
-                    else
-                        Program.acpi.DeviceSet(AsusACPI.GPUXG, 1, "GPU XGM");
-
-                    XGM.Init();
-
-                    await Task.Delay(TimeSpan.FromSeconds(15));
-                    await HardwareControl.RecreateGpuControlWithRetry(6, 5);
-
-                    if (AppConfig.IsApplyFans())
-                        XGM.SetFan(AppConfig.GetFanConfig(AsusFan.XGM));
+                    int command = AppConfig.Is("xgm_special") ? 0x101 : 1;
+                    // The dock is still inactive here. EnterTransition closes GPU writes, so the saved limit has to go out first.
+                    if (AppConfig.IsApplyGpuPower())
+                    {
+                        using (XgMitigation.Explicit(XgOp.Power | XgOp.GpuThermal))
+                            Program.modeControl.SetGPUPower();
+                    }
+                    XgMitigation.Shared.EnterTransition("GPUXG activate");
+                    try
+                    {
+                        Program.acpi.DeviceSet(AsusACPI.GPUXG, command, "GPU XGM");
+                        XGM.Init();
+                        await Task.Delay(TimeSpan.FromSeconds(15));
+                        await HardwareControl.RecreateGpuControlWithRetry(6, 5);
+                    }
+                    finally
+                    {
+                        XgMitigation.Shared.ExitTransition("GPUXG activate");
+                        settings.fansForm?.ApplyXgLock();
+                    }
 
                 }
 

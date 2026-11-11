@@ -510,11 +510,11 @@ namespace GHelper.Input
             {
                 if (e.Key == keyProfile) modeControl.CyclePerformanceMode(true);
 
-                if (e.Key == keyProfile0) modeControl.SetPerformanceMode(0, true);
-                if (e.Key == keyProfile1) modeControl.SetPerformanceMode(1, true);
-                if (e.Key == keyProfile2) modeControl.SetPerformanceMode(2, true);
-                if (e.Key == keyProfile3) modeControl.SetPerformanceMode(3, true);
-                if (e.Key == keyProfile4) modeControl.SetPerformanceMode(4, true);
+                if (e.Key == keyProfile0) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(0, true); }
+                if (e.Key == keyProfile1) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(1, true); }
+                if (e.Key == keyProfile2) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(2, true); }
+                if (e.Key == keyProfile3) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(3, true); }
+                if (e.Key == keyProfile4) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(4, true); }
                 if (e.Key == keyXGM) Program.settingsForm.gpuControl.ToggleXGM(true);
                 if (e.Key == keyOverlay) Program.settingsForm.BeginInvoke(() => Program.settingsForm.ToggleOverlay(true));
 

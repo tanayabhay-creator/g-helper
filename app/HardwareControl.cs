@@ -448,24 +448,40 @@ public static class HardwareControl
     public static float? GetCPUTemp()
     {
         var last = DateTimeOffset.Now.ToUnixTimeSeconds();
-        if (Math.Abs(last - lastUpdate) < 2) return cpuTemp;
+        if (Math.Abs(last - lastUpdate) < 2)
+        {
+            XgTempTrace.Shared.RecordCached(cpuTemp);
+            return cpuTemp;
+        }
         lastUpdate = last;
 
         if (isPZ13) return (float)GetCPUTempWMI();
-        cpuTemp = Program.acpi.DeviceGet(AsusACPI.Temp_CPU);
+        var read = Program.acpi.ReadDecoded((uint)AsusACPI.Temp_CPU);
+        cpuTemp = read.Decoded;
 
-        if (cpuTemp < 0) try
+        if (cpuTemp < 0)
         {
-            if (_cpuTempCounter == null)
-                _cpuTempCounter = new PerformanceCounter("Thermal Zone Information", "Temperature", @"\_TZ.THRM", true);
+            try
+            {
+                if (_cpuTempCounter == null)
+                    _cpuTempCounter = new PerformanceCounter("Thermal Zone Information", "Temperature", @"\_TZ.THRM", true);
 
-            cpuTemp = _cpuTempCounter.NextValue() - 273;
+                cpuTemp = _cpuTempCounter.NextValue() - 273;
+                XgTempTrace.Shared.Record(read, TempOrigin.ThermalZone, cpuTemp);
+            }
+            catch (Exception)
+            {
+                XgTempTrace.Shared.Record(read, TempOrigin.Failed, cpuTemp);
+            }
         }
-        catch (Exception)
+        else if (!read.IoctlSucceeded || read.BytesReturned < 4)
         {
-            //Debug.WriteLine("Failed reading CPU temp :" + ex.Message);
+            XgTempTrace.Shared.Record(read, TempOrigin.Failed, cpuTemp);
         }
-
+        else
+        {
+            XgTempTrace.Shared.Record(read, TempOrigin.FreshAsus, cpuTemp);
+        }
 
         return cpuTemp;
     }

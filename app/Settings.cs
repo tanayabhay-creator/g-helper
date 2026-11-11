@@ -364,7 +364,8 @@ namespace GHelper
 
         private void ButtonAutoTDP_Click(object? sender, EventArgs e)
         {
-            allyControl.ToggleAutoTDP();
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                allyControl.ToggleAutoTDP();
         }
 
         private void LabelCharge_Click(object? sender, EventArgs e)
@@ -861,7 +862,11 @@ namespace GHelper
             {
                 var menuMode = new ToolStripMenuItem(mode.Value);
                 menuMode.Tag = mode.Key;
-                menuMode.Click += (sender, args) => { Program.modeControl.SetPerformanceMode(mode.Key); };
+                menuMode.Click += (sender, args) =>
+                {
+                    using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                        Program.modeControl.SetPerformanceMode(mode.Key);
+                };
                 menuMode.Margin = padding;
                 menuMode.Checked = (mode.Key == currentMode);
                 contextMenuStrip.Items.Add(menuMode);
@@ -1778,13 +1783,26 @@ namespace GHelper
                     break;
             }
 
+            bool xgmLocked = Program.acpi.IsXGActive();
+            ButtonEnabled(buttonSilent, !xgmLocked);
+            ButtonEnabled(buttonBalanced, !xgmLocked);
+            ButtonEnabled(buttonTurbo, !xgmLocked);
+            if (xgmLocked)
+                labelPerf.Text = "Performance Mode locked while XG Mobile is on";
+            else if (labelPerf.Text.Contains("locked while XG Mobile"))
+                labelPerf.Text = Properties.Strings.PerformanceMode;
+
             foreach (var item in contextMenuStrip.Items)
             {
                 if (item is ToolStripMenuItem menuItem && menuItem.Tag is not null)
                 {
                     menuItem.Checked = ((int)menuItem.Tag == mode);
+                    menuItem.Enabled = !xgmLocked;
                 }
             }
+
+            if (fansForm != null && !fansForm.IsDisposed && fansForm.Text != "")
+                fansForm.ApplyXgLock();
         }
 
 
@@ -1819,6 +1837,7 @@ namespace GHelper
         void VisualizeXGM(bool connected, int activated, int GPUMode)
         {
             buttonXGM.Enabled = buttonXGM.Visible = connected;
+            ShowMode(Modes.GetCurrent());
 
             if (!connected) return;
 
@@ -2025,17 +2044,20 @@ namespace GHelper
 
         private void ButtonSilent_Click(object? sender, EventArgs e)
         {
-            Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceSilent);
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceSilent);
         }
 
         private void ButtonBalanced_Click(object? sender, EventArgs e)
         {
-            Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceBalanced);
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceBalanced);
         }
 
         private void ButtonTurbo_Click(object? sender, EventArgs e)
         {
-            Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceTurbo);
+            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+                Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceTurbo);
         }
 
 
