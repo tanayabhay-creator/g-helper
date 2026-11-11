@@ -1,0 +1,4179 @@
+﻿diff --git a/app/Ally/AllyControl.cs b/app/Ally/AllyControl.cs
+index 0b1a83b..dd4911d 100644
+--- a/app/Ally/AllyControl.cs
++++ b/app/Ally/AllyControl.cs
+@@ -344,6 +344,10 @@ namespace GHelper.Ally
+ 
+         private void SetTDP(int tdp, string log)
+         {
++            using var lease = XgMitigation.Shared.Enter("Ally.SetTDP", "DEVS", XgOp.Power);
++            if (!lease.Allowed) return;
++            if (!lease.Enforced && Program.acpi.IsXGActive()) return;
++
+             if (tdp < tdpStable) tdp = tdpStable;
+ 
+             int max = GetMaxTDP();
+@@ -352,9 +356,11 @@ namespace GHelper.Ally
+             if (tdp == tdpCurrent) return;
+             if (!autoTDP) return;
+ 
+-            Program.acpi.DeviceSet(AsusACPI.PPT_APUA0, tdp, log);
+-            Program.acpi.DeviceSet(AsusACPI.PPT_APUA3, tdp, null);
+-            Program.acpi.DeviceSet(AsusACPI.PPT_APUC1, tdp, null);
++            int slow = Program.acpi.DeviceSet(AsusACPI.PPT_APUA0, tdp, log);
++            int sustained = Program.acpi.DeviceSet(AsusACPI.PPT_APUA3, tdp, null);
++            int fast = Program.acpi.DeviceSet(AsusACPI.PPT_APUC1, tdp, null);
++            if (slow == XgMitigation.Suppressed || sustained == XgMitigation.Suppressed || fast == XgMitigation.Suppressed)
++                return;
+ 
+             tdpCurrent = tdp;
+         }
+diff --git a/app/AsusACPI.cs b/app/AsusACPI.cs
+index e8aeadf..3ae8313 100644
+--- a/app/AsusACPI.cs
++++ b/app/AsusACPI.cs
+@@ -329,6 +329,7 @@ public class AsusACPI
+         {
+             MaxTotal = 50;
+             DefaultTotal = 30;
++            XgMitigation.Shared.Enable(ReadDockSnapshot);
+         }
+ 
+         if (AppConfig.IsIntelHX())
+@@ -383,18 +384,44 @@ public class AsusACPI
+ 
+     public void Control(uint dwIoControlCode, byte[] lpInBuffer, byte[] lpOutBuffer)
+     {
++        ControlObserved(dwIoControlCode, lpInBuffer, lpOutBuffer);
++    }
+ 
+-        uint lpBytesReturned = 0;
+-        DeviceIoControl(
+-            handle,
+-            dwIoControlCode,
+-            lpInBuffer,
+-            (uint)lpInBuffer.Length,
+-            lpOutBuffer,
+-            (uint)lpOutBuffer.Length,
+-            ref lpBytesReturned,
+-            IntPtr.Zero
+-        );
++    // SetLastError is set on the P/Invoke. GetLastWin32Error is meaningful only after a false return,
++    // and only as a recorded number. This code does not map that number to a cause.
++    private readonly struct Transport
++    {
++        public bool IoctlSucceeded { get; init; }
++        public uint BytesReturned { get; init; }
++        public int Win32Error { get; init; }
++        public byte[] Buffer { get; init; }
++    }
++
++    private Transport ControlObserved(uint dwIoControlCode, byte[] lpInBuffer, byte[] lpOutBuffer)
++    {
++        uint bytes = 0;
++        bool ok = false;
++        int error = 0;
++        try
++        {
++            ok = DeviceIoControl(
++                handle,
++                dwIoControlCode,
++                lpInBuffer,
++                (uint)lpInBuffer.Length,
++                lpOutBuffer,
++                (uint)lpOutBuffer.Length,
++                ref bytes,
++                IntPtr.Zero
++            );
++            error = Marshal.GetLastWin32Error();
++        }
++        catch
++        {
++            ok = false;
++            error = Marshal.GetLastWin32Error();
++        }
++        return new Transport { IoctlSucceeded = ok, BytesReturned = bytes, Win32Error = error, Buffer = lpOutBuffer };
+     }
+ 
+     public void Close()
+@@ -404,20 +431,20 @@ public class AsusACPI
+ 
+ 
+     protected byte[] CallMethod(uint MethodID, byte[] args)
++    {
++        return CallObserved(MethodID, args).Buffer;
++    }
++
++    private Transport CallObserved(uint methodId, byte[] args)
+     {
+         byte[] acpiBuf = new byte[8 + args.Length];
+         byte[] outBuffer = new byte[16];
+ 
+-        BitConverter.GetBytes((uint)MethodID).CopyTo(acpiBuf, 0);
++        BitConverter.GetBytes((uint)methodId).CopyTo(acpiBuf, 0);
+         BitConverter.GetBytes((uint)args.Length).CopyTo(acpiBuf, 4);
+         Array.Copy(args, 0, acpiBuf, 8, args.Length);
+ 
+-        // if (MethodID == DEVS)  Debug.WriteLine(BitConverter.ToString(acpiBuf, 0, acpiBuf.Length));
+-
+-        Control(CONTROL_CODE, acpiBuf, outBuffer);
+-
+-        return outBuffer;
+-
++        return ControlObserved(CONTROL_CODE, acpiBuf, outBuffer);
+     }
+ 
+     public byte[] DeviceInit()
+@@ -436,37 +463,72 @@ public class AsusACPI
+ 
+     public int DeviceSet(uint DeviceID, int Status, string? logName)
+     {
+-        byte[] args = new byte[8];
+-        BitConverter.GetBytes((uint)DeviceID).CopyTo(args, 0);
+-        BitConverter.GetBytes((uint)Status).CopyTo(args, 4);
+-
+-        byte[] status = CallMethod(DEVS, args);
+-        int result = BitConverter.ToInt32(status, 0);
+-
+-        if (logName is not null)
+-            Logger.WriteLine(logName + " = " + Status + " : " + (result == 1 ? "OK" : result));
+-
+-        return result;
++        DevsOutcome Write() => WriteDevs(DeviceID, Status, logName);
++        if (DeviceID == GPUXG)
++            return XgMitigation.Shared.RunLifecycle(logName ?? "GPU XGM", DeviceID, Status.ToString(), Write);
++        if (XgMitigation.IsGuardedDevice(DeviceID))
++            return XgMitigation.Shared.RunGuarded(logName ?? "DeviceSet", DeviceID, Status.ToString(), Write);
++        return Write().Result;
+     }
+ 
+ 
+     public int DeviceSet(uint DeviceID, byte[] Params, string? logName)
+     {
+-        byte[] args = new byte[4 + Params.Length];
+-        BitConverter.GetBytes((uint)DeviceID).CopyTo(args, 0);
+-        Params.CopyTo(args, 4);
++        string requested = BitConverter.ToString(Params);
++        DevsOutcome Write() => WriteDevs(DeviceID, Params, logName);
++        if (DeviceID == GPUXG)
++            return XgMitigation.Shared.RunLifecycle(logName ?? "GPU XGM", DeviceID, requested, Write);
++        if (XgMitigation.IsGuardedDevice(DeviceID))
++            return XgMitigation.Shared.RunGuarded(logName ?? "DeviceSet", DeviceID, requested, Write);
++        return Write().Result;
++    }
+ 
+-        byte[] status = CallMethod(DEVS, args);
+-        int result = BitConverter.ToInt32(status, 0);
++    private DevsOutcome WriteDevs(uint deviceId, int status, string? logName)
++    {
++        byte[] args = new byte[8];
++        BitConverter.GetBytes(deviceId).CopyTo(args, 0);
++        BitConverter.GetBytes((uint)status).CopyTo(args, 4);
++        return FinishDevs(CallObserved(DEVS, args), logName, status.ToString());
++    }
+ 
+-        if (logName is not null)
+-            Logger.WriteLine(logName + " = " + BitConverter.ToString(Params) + " : " + (result == 1 ? "OK" : result));
++    private DevsOutcome WriteDevs(uint deviceId, byte[] parms, string? logName)
++    {
++        byte[] args = new byte[4 + parms.Length];
++        BitConverter.GetBytes(deviceId).CopyTo(args, 0);
++        parms.CopyTo(args, 4);
++        return FinishDevs(CallObserved(DEVS, args), logName, BitConverter.ToString(parms));
++    }
+ 
+-        return BitConverter.ToInt32(status, 0);
++    private static DevsOutcome FinishDevs(Transport transport, string? logName, string requested)
++    {
++        int result = BitConverter.ToInt32(transport.Buffer, 0);
++        if (logName is not null)
++            Logger.WriteLine(logName + " = " + requested + " : " + (result == 1 ? "OK" : result));
++        return new DevsOutcome
++        {
++            Result = result,
++            IoctlSucceeded = transport.IoctlSucceeded,
++            BytesReturned = transport.BytesReturned,
++            Win32Error = transport.Win32Error
++        };
+     }
+ 
+ 
+     public static void DeviceSetWmi(uint DeviceID, int Status)
++    {
++        if (XgMitigation.IsGuardedDevice(DeviceID))
++        {
++            using var lease = XgMitigation.Shared.Enter("DeviceSetWmi", "WMI.DEVS", XgMitigation.OperationForDevice(DeviceID), DeviceID, Status.ToString());
++            if (!lease.Allowed) return;
++            WriteWmiDevs(DeviceID, Status);
++            XgMitigation.Shared.LogCompleted(lease, "DeviceSetWmi", "WMI.DEVS", Status.ToString(), "wmi_called");
++            return;
++        }
++
++        WriteWmiDevs(DeviceID, Status);
++    }
++
++    static void WriteWmiDevs(uint DeviceID, int Status)
+     {
+         try
+         {
+@@ -485,12 +547,26 @@ public class AsusACPI
+ 
+     public int DeviceGet(uint DeviceID)
+     {
+-        byte[] args = new byte[8];
+-        BitConverter.GetBytes((uint)DeviceID).CopyTo(args, 0);
+-        byte[] status = CallMethod(DSTS, args);
++        return ReadDecoded(DeviceID).Decoded;
++    }
+ 
+-        return BitConverter.ToInt32(status, 0) - 65536;
++    public DecodedRead ReadDecoded(uint deviceId)
++    {
++        byte[] args = new byte[8];
++        BitConverter.GetBytes(deviceId).CopyTo(args, 0);
++        var transport = CallObserved(DSTS, args);
++        return new DecodedRead
++        {
++            IoctlSucceeded = transport.IoctlSucceeded,
++            BytesReturned = transport.BytesReturned,
++            Win32Error = transport.Win32Error,
++            Buffer = transport.Buffer
++        };
++    }
+ 
++    public XgDockSnapshot ReadDockSnapshot()
++    {
++        return XgDockClassifier.FromReads(ReadDecoded(GPUXGConnected), ReadDecoded(GPUXG));
+     }
+ 
+     public byte[] DeviceGetBuffer(uint DeviceID, uint Status = 0)
+@@ -759,7 +835,14 @@ public class AsusACPI
+ 
+     public bool IsXGConnected()
+     {
+-        return IsSupported(GPUXGConnected) && DeviceGet(GPUXGConnected) == 1;
++        // A failed read is not cached. IsSupported keeps a permanent false for other IDs; the dock does not use that cache.
++        return XgDockClassifier.Classify(ReadDecoded(GPUXGConnected)) == XgValueClass.One;
++    }
++
++    public bool IsXGActive()
++    {
++        // Connected is not enough. Active requires a successful decoded 1 from both the connected ID and GPUXG.
++        return ReadDockSnapshot().State == XgDockState.Active;
+     }
+ 
+     public bool IsExternalDisplayConnected()
+@@ -782,6 +865,8 @@ public class AsusACPI
+ 
+     public bool IsSupported(uint DeviceID)
+     {
++        // The first result, including a failed read, stays for the process lifetime.
++        // Dock decisions do not call this.
+         if (!_supportCache.TryGetValue(DeviceID, out bool supported))
+         {
+             supported = DeviceGet(DeviceID) >= 0;
+diff --git a/app/Fan/FanSensorControl.cs b/app/Fan/FanSensorControl.cs
+index 7a8067e..f53106a 100644
+--- a/app/Fan/FanSensorControl.cs
++++ b/app/Fan/FanSensorControl.cs
+@@ -137,17 +137,22 @@ namespace GHelper.Fan
+         public void StartCalibration()
+         {
+ 
+-            measuredMax = new int[] { 0, 0, 0 };
+-            timer.Enabled = true;
+-
+-            for (int i = 0; i < FAN_COUNT; i++)
+-                AppConfig.Remove("fan_max_" + i);
++            using (XgMitigation.Explicit(XgOp.Profile | XgOp.Fan))
++            {
++                int modeResult = Program.acpi.DeviceSet(AsusACPI.PerformanceMode, AsusACPI.PerformanceTurbo, "ModeCalibration");
++                if (modeResult == XgMitigation.Suppressed) return;
+ 
+-            Program.acpi.DeviceSet(AsusACPI.PerformanceMode, AsusACPI.PerformanceTurbo, "ModeCalibration");
++                for (int i = 0; i < FAN_COUNT; i++)
++                {
++                    int curveResult = Program.acpi.SetFanCurve((AsusFan)i, new byte[] { 20, 30, 40, 50, 60, 70, 80, 90, 100, 100, 100, 100, 100, 100, 100, 100 });
++                    if (curveResult == XgMitigation.Suppressed) return;
++                }
++            }
+ 
++            measuredMax = new int[] { 0, 0, 0 };
+             for (int i = 0; i < FAN_COUNT; i++)
+-                Program.acpi.SetFanCurve((AsusFan)i, new byte[] { 20, 30, 40, 50, 60, 70, 80, 90, 100, 100, 100, 100, 100, 100, 100, 100 });
+-
++                AppConfig.Remove("fan_max_" + i);
++            timer.Enabled = true;
+         }
+ 
+         private void Timer_Elapsed(object? sender, System.Timers.ElapsedEventArgs e)
+@@ -191,7 +196,8 @@ namespace GHelper.Fan
+         {
+ 
+             timer.Enabled = false;
+-            modeControl.SetPerformanceMode();
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                modeControl.SetPerformanceMode();
+ 
+             string label = "Measured - CPU: " + AppConfig.Get("fan_max_" + (int)AsusFan.CPU) * 100;
+ 
+diff --git a/app/Fans.cs b/app/Fans.cs
+index 45df8d2..70844f6 100644
+--- a/app/Fans.cs
++++ b/app/Fans.cs
+@@ -39,7 +39,33 @@ namespace GHelper
+         FanSensorControl fanSensorControl;
+ 
+         static int gpuPowerBase = 0;
+-        static bool isGPUPower => gpuPowerBase > 0;
++        bool gpuPowerReady;
++        DecodedRead gpuBaseRead;
++        DecodedRead gpuPowerRead;
++        int? gpuMeasuredMax;
++        bool gpuEco;
++        string? gpuInitFault;
++        string? lastGpuDiagnostic;
++        GpuPowerCapability.Result gpuPowerCapability = GpuPowerCapability.Result.Unavailable;
++        bool gpuLimitPowerSupported;
++        bool gpuLimitBoostSupported;
++        bool gpuLimitTempSupported;
++        bool gpuClockOffsetSupported;
++        bool gpuClockLimitSupported;
++        bool gpuNvidiaPresent;
++        bool gpuBoostResponds;
++        bool gpuTempResponds;
++        bool loadingGpuLimits;
++        bool gpuGesture;
++        bool gpuDisplayCommitted;
++        int gestureBoost = -1;
++        int gestureTemp = -1;
++        int gesturePower = -1;
++        int committedBoost;
++        int committedTemp;
++        int committedPower;
++        Label? labelGpuLimitLock;
++        RButton buttonApplyGpuLimits = null!;
+         static bool clampFanDots = AppConfig.IsClampFanDots();
+ 
+         public Fans()
+@@ -47,6 +73,40 @@ namespace GHelper
+ 
+             InitializeComponent();
+ 
++            labelGpuLimitLock = new Label
++            {
++                Name = "labelGpuLimitLock",
++                AutoSize = true,
++                Visible = false,
++                Dock = DockStyle.Top,
++                Padding = new Padding(8, 6, 8, 6),
++                Text = XgMitigation.GpuLimitsLockedText
++            };
++            panelGPU.Controls.Add(labelGpuLimitLock);
++            labelGpuLimitLock.BringToFront();
++
++            var panelApplyGpuLimits = new Panel
++            {
++                Name = "panelApplyGpuLimits",
++                AutoSize = true,
++                Dock = DockStyle.Top,
++                Padding = new Padding(15)
++            };
++            buttonApplyGpuLimits = new RButton
++            {
++                Name = "buttonApplyGpuLimits",
++                Text = Properties.Strings.ApplyPowerLimits,
++                Dock = DockStyle.Top,
++                Height = 46,
++                Secondary = true,
++                FlatStyle = FlatStyle.Flat,
++                UseVisualStyleBackColor = false
++            };
++            buttonApplyGpuLimits.Click += ButtonApplyGpuLimits_Click;
++            panelApplyGpuLimits.Controls.Add(buttonApplyGpuLimits);
++            panelGPU.Controls.Add(panelApplyGpuLimits);
++            panelApplyGpuLimits.SendToBack();
++
+             fanSensorControl = new FanSensorControl(this);
+ 
+             //float dpi = ControlHelper.GetDpiScale(this).Value;
+@@ -253,6 +313,8 @@ namespace GHelper
+             comboPowerMode.ValueMember = "Key";
+ 
+             FillModes(false);
++            gpuBaseRead = Program.acpi.ReadDecoded(AsusACPI.GPU_BASE);
++            RememberGpuPowerProbe(gpuBaseRead, default, null);
+             InitAll();
+             InitCPU();
+ 
+@@ -299,9 +361,6 @@ namespace GHelper
+ 
+             if (!Program.acpi.IsSupported(AsusACPI.DevsCPUFanCurve)) buttonCalibrate.Visible = false;
+ 
+-            gpuPowerBase = Program.acpi.DeviceGet(AsusACPI.GPU_BASE);
+-            panelGPUPower.Visible = isGPUPower;
+-
+             FormClosed += Fans_FormClosed;
+             Activated  += (_, _) => VisualiseAdvanced();
+ 
+@@ -367,7 +426,8 @@ namespace GHelper
+         private void CheckApplyUV_Click(object? sender, EventArgs e)
+         {
+             AppConfig.SetMode("auto_uv", checkApplyUV.Checked ? 1 : 0);
+-            modeControl.AutoRyzen();
++            using (XgMitigation.Explicit(XgMitigation.UvApply))
++                modeControl.AutoRyzen();
+         }
+ 
+         public void InitAll()
+@@ -436,7 +496,9 @@ namespace GHelper
+ 
+         private void ButtonApplyAdvanced_Click(object? sender, EventArgs e)
+         {
+-            string result = modeControl.SetRyzen(true);
++            string result;
++            using (XgMitigation.Explicit(XgMitigation.UvApply))
++                result = modeControl.SetRyzen(true);
+             checkApplyUV.Enabled = true;
+             ShowLabelRisky(result);
+         }
+@@ -552,7 +614,8 @@ namespace GHelper
+ 
+             Modes.Remove(mode);
+             FillModes();
+-            modeControl.SetPerformanceMode(AsusACPI.PerformanceBalanced);
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                modeControl.SetPerformanceMode(AsusACPI.PerformanceBalanced);
+ 
+         }
+ 
+@@ -569,7 +632,8 @@ namespace GHelper
+         {
+             int mode = Modes.Add();
+             FillModes();
+-            modeControl.SetPerformanceMode(mode);
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                modeControl.SetPerformanceMode(mode);
+         }
+ 
+         public void InitMode()
+@@ -577,6 +641,191 @@ namespace GHelper
+             int mode = Modes.GetCurrent();
+             comboModes.SelectedValue = mode;
+             buttonRename.Visible = buttonRemove.Visible = Modes.IsCurrentCustom();
++            ApplyXgLock();
++        }
++
++        public void ApplyXgLock()
++        {
++            if (InvokeRequired)
++            {
++                Invoke(ApplyXgLock);
++                return;
++            }
++
++            var decision = CurrentGpuDecision();
++            bool locked = !decision.CpuTdpEnabled;
++            comboModes.Enabled = !locked;
++            buttonAdd.Enabled = !locked;
++            buttonRemove.Enabled = !locked && Modes.IsCurrentCustom();
++            trackTotal.Enabled = decision.CpuTdpEnabled;
++            buttonReset.Enabled = !locked;
++            trackSlow.Enabled = decision.CpuTdpEnabled;
++            trackFast.Enabled = decision.CpuTdpEnabled;
++            trackCPU.Enabled = decision.CpuTdpEnabled;
++            trackCPUTemp.Enabled = !locked;
++            checkApplyPower.Enabled = decision.CpuTdpEnabled;
++            if (locked)
++                panelGPUtoCPU.Visible = false;
++            ApplyGpuDecision(decision);
++        }
++
++        bool GpuLimitsWritable()
++        {
++            if (XgMitigation.Shared.Enabled)
++                return XgMitigation.Shared.GpuLimitsOpen();
++            return !Program.acpi.IsXGActive();
++        }
++
++        GpuControlPresentation.Decision CurrentGpuDecision()
++        {
++            bool mitigation = XgMitigation.Shared.Enabled;
++            XgDockSnapshot snap;
++            bool admissionClosed = false;
++            if (mitigation)
++            {
++                snap = XgMitigation.Shared.Peek();
++                admissionClosed = XgMitigation.Shared.AdmissionClosed;
++            }
++            else
++            {
++                snap = new XgDockSnapshot
++                {
++                    State = Program.acpi.IsXGActive() ? XgDockState.Active : XgDockState.Inactive,
++                    HasSample = true,
++                    Source = "legacy_active"
++                };
++            }
++            return GpuControlPresentation.Decide(
++                snap, admissionClosed, mitigation, gpuNvidiaPresent, gpuPowerCapability,
++                gpuBoostResponds, gpuTempResponds, gpuClockOffsetSupported,
++                gpuEco, gpuInitFault, GpuControlPresentation.BuildVersion);
++        }
++
++        void RememberGpuPowerProbe(DecodedRead gpuBase, DecodedRead gpuPower, int? measuredMax)
++        {
++            gpuBaseRead = gpuBase;
++            gpuPowerRead = gpuPower;
++            gpuMeasuredMax = measuredMax;
++            gpuPowerCapability = GpuPowerCapability.Evaluate(
++                gpuBase, gpuPower, measuredMax, NvidiaSmi.GetDefaultMaxGPUPower());
++            gpuPowerReady = gpuPowerCapability.BasePositive && gpuPowerCapability.RangeEstablished;
++            gpuPowerBase = gpuPowerCapability.BasePositive ? gpuBase.Decoded : 0;
++        }
++
++        void ApplyGpuDecision(GpuControlPresentation.Decision decision)
++        {
++            var bound = GpuControlPresentation.Bind(decision, (gpuPowerBase + trackGPUPower.Value) + "W");
++            trackGPUPower.Enabled = bound.PowerEnabled;
++            trackGPUBoost.Enabled = bound.BoostEnabled;
++            trackGPUTemp.Enabled = bound.TempEnabled;
++            panelGPUPower.Visible = bound.PowerRowVisible;
++            panelGPUBoost.Visible = bound.BoostRowVisible;
++            panelGPUTemp.Visible = bound.TempRowVisible;
++            panelGPUCore.Visible = bound.ClockOffsetVisible;
++            panelGPUMemory.Visible = bound.ClockOffsetVisible;
++            panelGPUClockLimit.Visible = bound.ClockLimitVisible;
++            labelGPUPower.Text = bound.PowerLabel;
++            gpuLimitPowerSupported = bound.PowerRowVisible;
++            gpuLimitBoostSupported = bound.BoostRowVisible;
++            gpuLimitTempSupported = bound.TempRowVisible;
++            gpuClockLimitSupported = bound.ClockLimitVisible;
++            if (labelGpuLimitLock is not null)
++            {
++                labelGpuLimitLock.Text = bound.Notice;
++                labelGpuLimitLock.Visible = bound.NoticeVisible;
++            }
++            buttonApplyGpuLimits.Enabled = bound.ApplyLimitsEnabled;
++            gpuVisible = buttonGPU.Visible = bound.PageVisible;
++            if (bound.Diagnostic != lastGpuDiagnostic)
++            {
++                lastGpuDiagnostic = bound.Diagnostic;
++                Logger.WriteLine(bound.Diagnostic);
++            }
++            if (!bound.PageVisible && panelGPU.Visible)
++                ToggleNavigation(0);
++        }
++
++        static void RestoreGpuKey(string key, int original)
++        {
++            if (original >= 0) AppConfig.SetMode(key, original);
++            else AppConfig.RemoveMode(key);
++        }
++
++        void RememberGpuGesture()
++        {
++            if (gpuGesture) return;
++            gestureBoost = AppConfig.GetMode("gpu_boost");
++            gestureTemp = AppConfig.GetMode("gpu_temp");
++            gesturePower = AppConfig.GetMode("gpu_power");
++            gpuGesture = true;
++        }
++
++        void CommitGpuDisplay()
++        {
++            committedBoost = trackGPUBoost.Value;
++            committedTemp = trackGPUTemp.Value;
++            committedPower = trackGPUPower.Value;
++            gpuDisplayCommitted = true;
++        }
++
++        int SavedGpuTrack(TrackBar track, string key, int committed)
++        {
++            int configured = AppConfig.GetMode(key);
++            int value = configured >= track.Minimum && configured <= track.Maximum
++                ? configured
++                : gpuDisplayCommitted ? committed : track.Value;
++            return Math.Max(Math.Min(value, track.Maximum), track.Minimum);
++        }
++
++        void ShowSavedGpuLimits(bool power, bool temp)
++        {
++            loadingGpuLimits = true;
++            try
++            {
++                if (power)
++                {
++                    trackGPUBoost.Value = SavedGpuTrack(trackGPUBoost, "gpu_boost", committedBoost);
++                    if (gpuPowerReady)
++                        trackGPUPower.Value = SavedGpuTrack(trackGPUPower, "gpu_power", committedPower);
++                }
++                if (temp)
++                    trackGPUTemp.Value = SavedGpuTrack(trackGPUTemp, "gpu_temp", committedTemp);
++            }
++            finally
++            {
++                loadingGpuLimits = false;
++            }
++            VisualiseGPUSettings();
++        }
++
++        void RestoreGpuGesture()
++        {
++            if (gpuGesture)
++            {
++                RestoreGpuKey("gpu_boost", gestureBoost);
++                RestoreGpuKey("gpu_temp", gestureTemp);
++                if (gpuPowerReady) RestoreGpuKey("gpu_power", gesturePower);
++                gpuGesture = false;
++            }
++            ShowSavedGpuLimits(true, true);
++            if (gpuDisplayCommitted) CommitGpuDisplay();
++        }
++
++        void RestoreDeniedGpuLimits(XgMitigation.GpuLimitApplyResult result)
++        {
++            if (gpuGesture)
++            {
++                if (result.PowerDenied)
++                {
++                    RestoreGpuKey("gpu_boost", gestureBoost);
++                    if (gpuPowerReady) RestoreGpuKey("gpu_power", gesturePower);
++                }
++                if (result.TempDenied)
++                    RestoreGpuKey("gpu_temp", gestureTemp);
++                gpuGesture = false;
++            }
++            ShowSavedGpuLimits(result.PowerDenied, result.TempDenied);
++            if (gpuDisplayCommitted) CommitGpuDisplay();
+         }
+ 
+         private void ComboModes_SelectedValueChanged(object? sender, EventArgs e)
+@@ -588,44 +837,100 @@ namespace GHelper
+ 
+             Debug.WriteLine(selectedMode);
+ 
+-            modeControl.SetPerformanceMode((int)selectedMode);
++            bool applied;
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                applied = modeControl.SetPerformanceMode((int)selectedMode);
++            if (!applied)
++                comboModes.SelectedValue = Modes.GetCurrent();
+         }
+ 
+         private void TrackGPU_MouseUp(object? sender, MouseEventArgs e)
+         {
+-            modeControl.SetGPUPower();
++            ApplyGpuLimits(sender == trackGPUTemp ? XgOp.GpuThermal : XgOp.Power);
+         }
+ 
+-        private void TrackGPUClocks_MouseUp(object? sender, MouseEventArgs e)
++        private void ButtonApplyGpuLimits_Click(object? sender, EventArgs e)
+         {
+-            modeControl.SetGPUClocks(true);
++            ApplyGpuLimits(XgOp.Power | XgOp.GpuThermal);
+         }
+ 
+-        private void InitGPUPower()
++        void ApplyGpuLimits(XgOp op)
+         {
+-            if (!isGPUPower) return;
++            if (loadingGpuLimits) return;
++            if (!GpuLimitsWritable())
++            {
++                RestoreGpuGesture();
++                return;
++            }
++
++            RememberGpuGesture();
++            if (trackGPUBoost.Enabled) AppConfig.SetMode("gpu_boost", trackGPUBoost.Value);
++            if (trackGPUTemp.Enabled) AppConfig.SetMode("gpu_temp", trackGPUTemp.Value);
++            if (gpuPowerReady && trackGPUPower.Enabled) AppConfig.SetMode("gpu_power", trackGPUPower.Value);
+ 
+-            int maxGPUPower = NvidiaSmi.GetMaxGPUPower();
+-            if (maxGPUPower > 0)
++            XgMitigation.GpuLimitApplyResult result;
++            using (XgMitigation.Explicit(op))
++                result = modeControl.SetGPUPower();
++            if (result.Suppressed)
++                RestoreDeniedGpuLimits(result);
++            else
+             {
+-                AsusACPI.MaxGPUPower = maxGPUPower - gpuPowerBase - AsusACPI.MaxGPUBoost;
+-                trackGPUPower.Minimum = AsusACPI.MinGPUPower;
+-                trackGPUPower.Maximum = AsusACPI.MaxGPUPower;
++                gpuGesture = false;
++                CommitGpuDisplay();
+             }
++        }
++
++        private void TrackGPUClocks_MouseUp(object? sender, MouseEventArgs e)
++        {
++            using (XgMitigation.Explicit(XgOp.Clocks))
++                modeControl.SetGPUClocks(true);
++        }
++
++        static void ShowPowerTrack(TrackBar track, int minimum, int maximum, int value)
++        {
++            int shown = Math.Max(Math.Min(value, maximum), minimum);
++            if (track.Maximum < shown) track.Maximum = shown;
++            if (track.Minimum > shown) track.Minimum = shown;
++            track.Value = shown;
++            track.Minimum = minimum;
++            track.Maximum = maximum;
++        }
++
++        private void InitGPUPower()
++        {
++            if (!gpuPowerReady || gpuPowerCapability.AdditionalMaximum is not int maximum) return;
++            int minimum = gpuPowerCapability.AdditionalMinimum ?? AsusACPI.MinGPUPower;
++            AsusACPI.MaxGPUPower = maximum;
+ 
+             Task.Run(async () =>
+             {
+                 await Task.Delay(TimeSpan.FromMilliseconds(200));
+-                int gpuPowerVar = Program.acpi.DeviceGet(AsusACPI.GPU_POWER);
++                DecodedRead powerRead = Program.acpi.ReadDecoded(AsusACPI.GPU_POWER);
++                int gpuPowerVar = GpuPowerCapability.TransportOk(powerRead) ? powerRead.Decoded : -1;
+                 Logger.WriteLine($"ReadGPUPower ({Modes.GetCurrentBase()}): {gpuPowerBase} + {gpuPowerVar}");
+-
+-                int gpu_power = AppConfig.GetMode("gpu_power");
+-                if (gpu_power < 0) gpu_power = (gpuPowerVar >= 0) ? gpuPowerVar : AsusACPI.MaxGPUPower;
++                int saved = AppConfig.GetMode("gpu_power");
+ 
+                 Invoke(delegate
+                 {
+-                    trackGPUPower.Value = Math.Max(Math.Min(gpu_power, AsusACPI.MaxGPUPower), AsusACPI.MinGPUPower);
+-                    VisualiseGPUSettings();
++                    loadingGpuLimits = true;
++                    try
++                    {
++                        RememberGpuPowerProbe(gpuBaseRead, powerRead, gpuMeasuredMax);
++                        if (gpuPowerReady && gpuPowerCapability.AdditionalMaximum is int liveMaximum)
++                        {
++                            int liveMinimum = gpuPowerCapability.AdditionalMinimum ?? minimum;
++                            int gpu_power = saved >= liveMinimum && saved <= liveMaximum ? saved
++                                : gpuPowerVar >= liveMinimum && gpuPowerVar <= liveMaximum ? gpuPowerVar
++                                : liveMaximum;
++                            ShowPowerTrack(trackGPUPower, liveMinimum, liveMaximum, gpu_power);
++                            CommitGpuDisplay();
++                        }
++                    }
++                    finally
++                    {
++                        loadingGpuLimits = false;
++                    }
++                    ApplyXgLock();
+                 });
+             });
+         }
+@@ -634,86 +939,106 @@ namespace GHelper
+         {
+             Task.Run(() =>
+             {
+-                if (Program.acpi.DeviceGet(AsusACPI.GPUEco) == 1)
+-                {
+-                    Invoke(delegate { gpuVisible = buttonGPU.Visible = false; });
+-                    return;
+-                }
+-
+-                if (HardwareControl.GpuControl is null || !HardwareControl.GpuControl.IsValid) HardwareControl.RecreateGpuControl();
+-
+-                if (HardwareControl.GpuControl is not NvidiaGpuControl nv)
+-                {
+-                    Invoke(delegate { gpuVisible = buttonGPU.Visible = false; });
+-                    return;
+-                }
+-
+-                nvControl = nv;
+-
++                bool eco = false;
++                bool havePowerProbe = false;
++                DecodedRead gpuBase = default;
++                DecodedRead gpuPower = default;
++                int? measured = null;
++                bool boostResponds = false;
++                bool tempResponds = false;
++                bool nvidia = false;
++                NvidiaGpuControl? nv = null;
++                string? gpuName = null;
++                int gpu_boost = AsusACPI.MaxGPUBoost;
++                int gpu_temp = AsusACPI.MaxGPUTemp;
++                int core = 0;
++                int memory = 0;
++                int clock_limit = NvidiaGpuControl.MaxClockLimit;
++                string? fault = null;
+                 try
+                 {
+-                    int gpu_boost = AppConfig.GetMode("gpu_boost");
+-                    int gpu_temp = AppConfig.GetMode("gpu_temp");
+-
+-                    int core = AppConfig.GetMode("gpu_core");
+-                    int memory = AppConfig.GetMode("gpu_memory");
+-                    int clock_limit = AppConfig.GetMode("gpu_clock_limit");
+-
++                    eco = Program.acpi.DeviceGet(AsusACPI.GPUEco) == 1;
++                    gpuBase = Program.acpi.ReadDecoded(AsusACPI.GPU_BASE);
++                    gpuPower = Program.acpi.ReadDecoded(AsusACPI.GPU_POWER);
++                    measured = NvidiaSmi.TryReadReportedMaxGpuPower(out int smiMax) ? smiMax : null;
++                    boostResponds = Program.acpi.DeviceGet(AsusACPI.PPT_GPUC0) >= 0;
++                    tempResponds = Program.acpi.DeviceGet(AsusACPI.PPT_GPUC2) >= 0;
++                    havePowerProbe = true;
++                    gpu_boost = AppConfig.GetMode("gpu_boost");
++                    gpu_temp = AppConfig.GetMode("gpu_temp");
+                     if (gpu_boost < 0) gpu_boost = AsusACPI.MaxGPUBoost;
+                     if (gpu_temp < 0) gpu_temp = AsusACPI.MaxGPUTemp;
+ 
++                    if (HardwareControl.GpuControl is null || !HardwareControl.GpuControl.IsValid) HardwareControl.RecreateGpuControl();
++                    nv = HardwareControl.GpuControl as NvidiaGpuControl;
++                    nvidia = nv is { IsValid: true };
++                    core = AppConfig.GetMode("gpu_core");
++                    memory = AppConfig.GetMode("gpu_memory");
++                    clock_limit = AppConfig.GetMode("gpu_clock_limit");
+                     if (core == -1) core = 0;
+                     if (memory == -1) memory = 0;
+                     if (clock_limit == -1) clock_limit = NvidiaGpuControl.MaxClockLimit;
+-
+-                    string? gpuName = null;
+-
+-                    if (nvControl is not null)
++                    if (nvidia && nv is not null)
+                     {
+-                        if (nvControl.GetClocks(out int current_core, out int current_memory))
++                        nvControl = nv;
++                        if (nv.GetClocks(out int current_core, out int current_memory))
+                         {
+                             core = current_core;
+                             memory = current_memory;
+                         }
+-
+-                        int _clockLimit = nvControl.GetMaxGPUCLock();
+-
+-                        if (_clockLimit == 0) clock_limit = NvidiaGpuControl.MaxClockLimit;
+-                        else if (_clockLimit > 0) clock_limit = _clockLimit;
+-
+-                        try { gpuName = nvControl.FullName; } catch { }
++                        int clockRead = nv.GetMaxGPUCLock();
++                        if (clockRead == 0) clock_limit = NvidiaGpuControl.MaxClockLimit;
++                        else if (clockRead > 0) clock_limit = clockRead;
++                        try { gpuName = nv.FullName; } catch { }
+                     }
+-
+-                    bool boostVisible = Program.acpi.IsSupported(AsusACPI.PPT_GPUC0);
+-                    bool tempVisible = Program.acpi.IsSupported(AsusACPI.PPT_GPUC2);
+-
+-                    Invoke(delegate
+-                    {
+-                        gpuVisible = buttonGPU.Visible = true;
+-                        if (gpuName is not null) labelGPU.Text = gpuName;
+-
+-                        trackGPUClockLimit.Value = Math.Max(Math.Min(clock_limit, NvidiaGpuControl.MaxClockLimit), NvidiaGpuControl.MinClockLimit);
+-
+-                        trackGPUCore.Value = Math.Max(Math.Min(core, NvidiaGpuControl.MaxCoreOffset), NvidiaGpuControl.MinCoreOffset);
+-                        trackGPUMemory.Value = Math.Max(Math.Min(memory, NvidiaGpuControl.MaxMemoryOffset), NvidiaGpuControl.MinMemoryOffset);
+-
+-                        trackGPUBoost.Value = Math.Max(Math.Min(gpu_boost, AsusACPI.MaxGPUBoost), AsusACPI.MinGPUBoost);
+-                        trackGPUTemp.Value = Math.Max(Math.Min(gpu_temp, AsusACPI.MaxGPUTemp), AsusACPI.MinGPUTemp);
+-
+-                        panelGPUBoost.Visible = boostVisible;
+-                        panelGPUTemp.Visible = tempVisible;
+-                        panelGPUCore.Visible = panelGPUMemory.Visible = nv.IsClockOffsetSupported;
+-
+-                        VisualiseGPUSettings();
+-
+-                        InitGPUPower();
+-                    });
+                 }
+                 catch (Exception ex)
+                 {
++                    fault = ex.GetType().Name;
+                     Logger.WriteLine(ex.ToString());
+-                    try { Invoke(delegate { gpuVisible = buttonGPU.Visible = false; }); } catch { }
+                 }
++
++                try
++                {
++                    Invoke(delegate
++                    {
++                        loadingGpuLimits = true;
++                        try
++                        {
++                            gpuInitFault = fault;
++                            gpuEco = eco;
++                            gpuNvidiaPresent = nvidia;
++                            gpuBoostResponds = boostResponds;
++                            gpuTempResponds = tempResponds;
++                            gpuClockOffsetSupported = nvidia && nv is { IsClockOffsetSupported: true };
++                            if (havePowerProbe) RememberGpuPowerProbe(gpuBase, gpuPower, measured);
++                            if (gpuName is not null) labelGPU.Text = gpuName;
++
++                            if (nvidia)
++                            {
++                                trackGPUClockLimit.Value = Math.Max(Math.Min(clock_limit, NvidiaGpuControl.MaxClockLimit), NvidiaGpuControl.MinClockLimit);
++                                trackGPUCore.Value = Math.Max(Math.Min(core, NvidiaGpuControl.MaxCoreOffset), NvidiaGpuControl.MinCoreOffset);
++                                trackGPUMemory.Value = Math.Max(Math.Min(memory, NvidiaGpuControl.MaxMemoryOffset), NvidiaGpuControl.MinMemoryOffset);
++                            }
++                            if (boostResponds)
++                                trackGPUBoost.Value = Math.Max(Math.Min(gpu_boost, AsusACPI.MaxGPUBoost), AsusACPI.MinGPUBoost);
++                            if (tempResponds)
++                                trackGPUTemp.Value = Math.Max(Math.Min(gpu_temp, AsusACPI.MaxGPUTemp), AsusACPI.MinGPUTemp);
++                            if (gpuPowerReady && gpuPowerCapability.AdditionalMaximum is int maximum)
++                                ShowPowerTrack(trackGPUPower, gpuPowerCapability.AdditionalMinimum ?? AsusACPI.MinGPUPower, maximum, maximum);
++
++                            VisualiseGPUSettings();
++                            CommitGpuDisplay();
++                            InitGPUPower();
++                        }
++                        finally
++                        {
++                            loadingGpuLimits = false;
++                        }
++                        ApplyXgLock();
++                    });
++                }
++                catch { }
+             });
+         }
+ 
+@@ -730,7 +1055,9 @@ namespace GHelper
+             else
+                 labelGPUClockLimit.Text = $"{trackGPUClockLimit.Value} MHz";
+ 
+-            labelGPUPower.Text = (gpuPowerBase + trackGPUPower.Value) + "W";
++            labelGPUPower.Text = gpuPowerReady
++                ? (gpuPowerBase + trackGPUPower.Value) + "W"
++                : GpuControlPresentation.WattUnavailableLabel;
+ 
+         }
+ 
+@@ -803,10 +1130,22 @@ namespace GHelper
+ 
+         private void trackGPUPower_Scroll(object? sender, EventArgs e)
+         {
++            if (loadingGpuLimits)
++            {
++                VisualiseGPUSettings();
++                return;
++            }
++            if (!GpuLimitsWritable())
++            {
++                RestoreGpuGesture();
++                return;
++            }
++
++            RememberGpuGesture();
+             AppConfig.SetMode("gpu_boost", trackGPUBoost.Value);
+             AppConfig.SetMode("gpu_temp", trackGPUTemp.Value);
+ 
+-            if (isGPUPower) AppConfig.SetMode("gpu_power", trackGPUPower.Value);
++            if (gpuPowerReady) AppConfig.SetMode("gpu_power", trackGPUPower.Value);
+ 
+             VisualiseGPUSettings();
+         }
+@@ -919,18 +1258,22 @@ namespace GHelper
+ 
+         private void TrackPower_MouseUp(object? sender, MouseEventArgs e)
+         {
++            XgOp op = sender == trackCPUTemp ? XgOp.CpuLimit : XgOp.Power;
+             Task.Run(() =>
+             {
+-                modeControl.AutoPower(true);
++                using (XgMitigation.Explicit(op))
++                    modeControl.AutoPower(true);
+             });
+         }
+ 
+ 
+         private void TrackPower_KeyUp(object? sender, KeyEventArgs e)
+         {
++            XgOp op = sender == trackCPUTemp ? XgOp.CpuLimit : XgOp.Power;
+             Task.Run(() =>
+             {
+-                modeControl.AutoPower(true);
++                using (XgMitigation.Explicit(op))
++                    modeControl.AutoPower(true);
+             });
+         }
+ 
+@@ -967,7 +1310,7 @@ namespace GHelper
+         {
+             if (AppConfig.GetMode("auto_boost") != comboBoost.SelectedIndex)
+             {
+-                PowerNative.SetCPUBoost(comboBoost.SelectedIndex);
++                XgMitigation.Shared.RunCpuBoost("ComboBoost", () => PowerNative.SetCPUBoost(comboBoost.SelectedIndex));
+             }
+             AppConfig.SetMode("auto_boost", comboBoost.SelectedIndex);
+         }
+@@ -978,7 +1321,8 @@ namespace GHelper
+             CheckBox chk = (CheckBox)sender;
+ 
+             AppConfig.SetMode("auto_apply_power", chk.Checked ? 1 : 0);
+-            modeControl.SetPerformanceMode();
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                modeControl.SetPerformanceMode();
+ 
+         }
+ 
+@@ -988,6 +1332,7 @@ namespace GHelper
+             CheckBox chk = (CheckBox)sender;
+ 
+             AppConfig.SetMode("auto_apply", chk.Checked ? 1 : 0);
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
+             modeControl.SetPerformanceMode();
+ 
+         }
+@@ -1037,7 +1382,7 @@ namespace GHelper
+             panelCPU.Visible = modeB0;
+ 
+             panelCrossLoad.Visible = modeCross;
+-            panelGPUtoCPU.Visible = modeGPUtoCPU;
++            panelGPUtoCPU.Visible = modeGPUtoCPU && !Program.acpi.IsXGActive();
+             panelCPUTemp.Visible = modeCPUTemp;
+ 
+             panelApplyPower.Visible = panelTitleCPU.Visible = modeA || modeB0 || modeC1;
+@@ -1305,6 +1650,7 @@ namespace GHelper
+ 
+         private void ButtonReset_Click(object? sender, EventArgs e)
+         {
++            using var explicitReset = XgMitigation.Explicit(XgMitigation.ResetApply);
+ 
+             LoadProfile(seriesCPU, AsusFan.CPU, true);
+             LoadProfile(seriesGPU, AsusFan.GPU, true);
+@@ -1395,7 +1741,8 @@ namespace GHelper
+             if (AppConfig.Is("xgm_fan"))
+                 SaveProfile(seriesXGM, AsusFan.XGM);
+ 
+-            modeControl.AutoFans();
++            using (XgMitigation.Explicit(XgOp.Fan))
++                modeControl.AutoFans();
+         }
+ 
+         private void ChartCPU_MouseUp(object? sender, MouseEventArgs e)
+diff --git a/app/GHelper.csproj b/app/GHelper.csproj
+index c5c3d60..b0d52ee 100644
+--- a/app/GHelper.csproj
++++ b/app/GHelper.csproj
+@@ -20,6 +20,7 @@
+     <IntermediateOutputPath>obj\x64\$(Configuration)\</IntermediateOutputPath>
+     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+     <AssemblyVersion>0.289</AssemblyVersion>
++    <InformationalVersion>0.289.1102.6-xg-gpu-apply</InformationalVersion>
+     <NoWarn>$(NoWarn);WFO1000</NoWarn>
+   </PropertyGroup>
+ 
+diff --git a/app/GHelper.sln b/app/GHelper.sln
+index abaf46a..88b32c1 100644
+--- a/app/GHelper.sln
++++ b/app/GHelper.sln
+@@ -5,6 +5,8 @@ VisualStudioVersion = 17.4.33403.182
+ MinimumVisualStudioVersion = 10.0.40219.1
+ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GHelper", "GHelper.csproj", "{D6138BB1-8FDB-4835-87EF-2FE41A3DD604}"
+ EndProject
++Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GHelper.XgTests", "..\tests\GHelper.XgTests\GHelper.XgTests.csproj", "{7C4E9A21-6B18-4F0D-9C55-2A8E4D1B0F73}"
++EndProject
+ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{B6E44CC6-5D28-4CB9-8EE2-BE9D6238E2D6}"
+ 	ProjectSection(SolutionItems) = preProject
+ 		.editorconfig = .editorconfig
+@@ -20,6 +22,10 @@ Global
+ 		{D6138BB1-8FDB-4835-87EF-2FE41A3DD604}.Debug|x64.Build.0 = Debug|x64
+ 		{D6138BB1-8FDB-4835-87EF-2FE41A3DD604}.Release|x64.ActiveCfg = Release|x64
+ 		{D6138BB1-8FDB-4835-87EF-2FE41A3DD604}.Release|x64.Build.0 = Release|x64
++		{7C4E9A21-6B18-4F0D-9C55-2A8E4D1B0F73}.Debug|x64.ActiveCfg = Debug|x64
++		{7C4E9A21-6B18-4F0D-9C55-2A8E4D1B0F73}.Debug|x64.Build.0 = Debug|x64
++		{7C4E9A21-6B18-4F0D-9C55-2A8E4D1B0F73}.Release|x64.ActiveCfg = Release|x64
++		{7C4E9A21-6B18-4F0D-9C55-2A8E4D1B0F73}.Release|x64.Build.0 = Release|x64
+ 	EndGlobalSection
+ 	GlobalSection(SolutionProperties) = preSolution
+ 		HideSolutionNode = FALSE
+diff --git a/app/Gpu/GPUModeControl.cs b/app/Gpu/GPUModeControl.cs
+index b8d5eeb..ea76c7a 100644
+--- a/app/Gpu/GPUModeControl.cs
++++ b/app/Gpu/GPUModeControl.cs
+@@ -313,35 +313,54 @@ namespace GHelper.Gpu
+ 
+                     if (silent)
+                     {
+-                        Program.acpi.DeviceSet(AsusACPI.GPUXG, 0, "GPU XGM");
+-                        await Task.Delay(TimeSpan.FromSeconds(15));
++                        XgMitigation.Shared.EnterTransition("GPUXG eject");
++                        try
++                        {
++                            Program.acpi.DeviceSet(AsusACPI.GPUXG, 0, "GPU XGM");
++                            await Task.Delay(TimeSpan.FromSeconds(15));
++                        }
++                        finally
++                        {
++                            XgMitigation.Shared.ExitTransition("GPUXG eject");
++                            settings.fansForm?.ApplyXgLock();
++                        }
+                     }
+                     else
+                     {
+                         DialogResult dialogResult = settings.ShowMessage("Did you close all applications running on XG Mobile?", "Disabling XG Mobile", MessageBoxButtons.YesNo);
+                         if (dialogResult == DialogResult.Yes)
+                         {
+-                            Program.acpi.DeviceSet(AsusACPI.GPUXG, 0, "GPU XGM");
+-                            await Task.Delay(TimeSpan.FromSeconds(15));
+-                            HardwareControl.RecreateGpuControl();
++                            XgMitigation.Shared.EnterTransition("GPUXG eject");
++                            try
++                            {
++                                Program.acpi.DeviceSet(AsusACPI.GPUXG, 0, "GPU XGM");
++                                await Task.Delay(TimeSpan.FromSeconds(15));
++                                HardwareControl.RecreateGpuControl();
++                            }
++                            finally
++                            {
++                                XgMitigation.Shared.ExitTransition("GPUXG eject");
++                                settings.fansForm?.ApplyXgLock();
++                            }
+                         }
+                     }
+                 }
+                 else
+                 {
+-
+-                    if (AppConfig.Is("xgm_special"))
+-                        Program.acpi.DeviceSet(AsusACPI.GPUXG, 0x101, "GPU XGM");
+-                    else
+-                        Program.acpi.DeviceSet(AsusACPI.GPUXG, 1, "GPU XGM");
+-
+-                    XGM.Init();
+-
+-                    await Task.Delay(TimeSpan.FromSeconds(15));
+-                    await HardwareControl.RecreateGpuControlWithRetry(6, 5);
+-
+-                    if (AppConfig.IsApplyFans())
+-                        XGM.SetFan(AppConfig.GetFanConfig(AsusFan.XGM));
++                    int command = AppConfig.Is("xgm_special") ? 0x101 : 1;
++                    XgMitigation.Shared.EnterTransition("GPUXG activate");
++                    try
++                    {
++                        Program.acpi.DeviceSet(AsusACPI.GPUXG, command, "GPU XGM");
++                        XGM.Init();
++                        await Task.Delay(TimeSpan.FromSeconds(15));
++                        await HardwareControl.RecreateGpuControlWithRetry(6, 5);
++                    }
++                    finally
++                    {
++                        XgMitigation.Shared.ExitTransition("GPUXG activate");
++                        settings.fansForm?.ApplyXgLock();
++                    }
+ 
+                 }
+ 
+diff --git a/app/Gpu/NVidia/NvidiaSmi.cs b/app/Gpu/NVidia/NvidiaSmi.cs
+index eb4cd32..478d0e4 100644
+--- a/app/Gpu/NVidia/NvidiaSmi.cs
++++ b/app/Gpu/NVidia/NvidiaSmi.cs
+@@ -13,17 +13,21 @@ public static class NvidiaSmi
+         else return 175;
+     }
+ 
+-    public static int GetMaxGPUPower()
++    public static bool TryReadReportedMaxGpuPower(out int watts)
+     {
++        watts = 0;
+         string output = RunNvidiaSmiCommand("--query-gpu=power.max_limit --format csv,noheader,nounits");
+         output = output.Trim().Trim('\n', '\r').Replace(".00","").Replace(",00", "");
++        if (!float.TryParse(output, out float floatValue)) return false;
++        int intValue = (int)floatValue;
++        if (intValue < 50 || intValue > 175) return false;
++        watts = intValue;
++        return true;
++    }
+ 
+-        if (float.TryParse(output, out float floatValue))
+-        {
+-            int intValue = (int)floatValue;
+-            if (intValue >= 50 && intValue <= 175) return intValue;
+-        }
+-
++    public static int GetMaxGPUPower()
++    {
++        if (TryReadReportedMaxGpuPower(out int watts)) return watts;
+         return GetDefaultMaxGPUPower();
+     }
+ 
+diff --git a/app/HardwareControl.cs b/app/HardwareControl.cs
+index fb63012..167f3e3 100644
+--- a/app/HardwareControl.cs
++++ b/app/HardwareControl.cs
+@@ -448,24 +448,40 @@ public static class HardwareControl
+     public static float? GetCPUTemp()
+     {
+         var last = DateTimeOffset.Now.ToUnixTimeSeconds();
+-        if (Math.Abs(last - lastUpdate) < 2) return cpuTemp;
++        if (Math.Abs(last - lastUpdate) < 2)
++        {
++            XgTempTrace.Shared.RecordCached(cpuTemp);
++            return cpuTemp;
++        }
+         lastUpdate = last;
+ 
+         if (isPZ13) return (float)GetCPUTempWMI();
+-        cpuTemp = Program.acpi.DeviceGet(AsusACPI.Temp_CPU);
++        var read = Program.acpi.ReadDecoded((uint)AsusACPI.Temp_CPU);
++        cpuTemp = read.Decoded;
+ 
+-        if (cpuTemp < 0) try
++        if (cpuTemp < 0)
+         {
+-            if (_cpuTempCounter == null)
+-                _cpuTempCounter = new PerformanceCounter("Thermal Zone Information", "Temperature", @"\_TZ.THRM", true);
++            try
++            {
++                if (_cpuTempCounter == null)
++                    _cpuTempCounter = new PerformanceCounter("Thermal Zone Information", "Temperature", @"\_TZ.THRM", true);
+ 
+-            cpuTemp = _cpuTempCounter.NextValue() - 273;
++                cpuTemp = _cpuTempCounter.NextValue() - 273;
++                XgTempTrace.Shared.Record(read, TempOrigin.ThermalZone, cpuTemp);
++            }
++            catch (Exception)
++            {
++                XgTempTrace.Shared.Record(read, TempOrigin.Failed, cpuTemp);
++            }
+         }
+-        catch (Exception)
++        else if (!read.IoctlSucceeded || read.BytesReturned < 4)
+         {
+-            //Debug.WriteLine("Failed reading CPU temp :" + ex.Message);
++            XgTempTrace.Shared.Record(read, TempOrigin.Failed, cpuTemp);
++        }
++        else
++        {
++            XgTempTrace.Shared.Record(read, TempOrigin.FreshAsus, cpuTemp);
+         }
+-
+ 
+         return cpuTemp;
+     }
+diff --git a/app/Input/InputDispatcher.cs b/app/Input/InputDispatcher.cs
+index 38e3fe4..ad56e71 100644
+--- a/app/Input/InputDispatcher.cs
++++ b/app/Input/InputDispatcher.cs
+@@ -510,11 +510,11 @@ namespace GHelper.Input
+             {
+                 if (e.Key == keyProfile) modeControl.CyclePerformanceMode(true);
+ 
+-                if (e.Key == keyProfile0) modeControl.SetPerformanceMode(0, true);
+-                if (e.Key == keyProfile1) modeControl.SetPerformanceMode(1, true);
+-                if (e.Key == keyProfile2) modeControl.SetPerformanceMode(2, true);
+-                if (e.Key == keyProfile3) modeControl.SetPerformanceMode(3, true);
+-                if (e.Key == keyProfile4) modeControl.SetPerformanceMode(4, true);
++                if (e.Key == keyProfile0) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(0, true); }
++                if (e.Key == keyProfile1) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(1, true); }
++                if (e.Key == keyProfile2) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(2, true); }
++                if (e.Key == keyProfile3) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(3, true); }
++                if (e.Key == keyProfile4) { using (XgMitigation.Explicit(XgMitigation.ProfileApply)) modeControl.SetPerformanceMode(4, true); }
+                 if (e.Key == keyXGM) Program.settingsForm.gpuControl.ToggleXGM(true);
+                 if (e.Key == keyOverlay) Program.settingsForm.BeginInvoke(() => Program.settingsForm.ToggleOverlay(true));
+ 
+diff --git a/app/Mode/GpuControlPresentation.cs b/app/Mode/GpuControlPresentation.cs
+new file mode 100644
+index 0000000..ad8139b
+--- /dev/null
++++ b/app/Mode/GpuControlPresentation.cs
+@@ -0,0 +1,244 @@
++using System.Reflection;
++
++namespace GHelper.Mode;
++
++// Upstream range: nvidia-smi power.max_limit when it parses, otherwise the model fallback.
++// The fallback is not a measured XG Mobile limit. A missing GPU_BASE still has no range.
++public static class GpuPowerLimit
++{
++    public static int AdditionalMaximum(int gpuBase, int reportedMax)
++        => reportedMax - gpuBase - AsusACPI.MaxGPUBoost;
++
++    public static bool PowerInRange(int gpuPower)
++        => gpuPower >= AsusACPI.MinGPUPower && gpuPower <= AsusACPI.MaxGPUPower;
++
++    public static bool BoostInRange(int gpuBoost)
++        => gpuBoost >= AsusACPI.MinGPUBoost && gpuBoost <= AsusACPI.MaxGPUBoost;
++
++    public static bool TempInRange(int gpuTemp)
++        => gpuTemp >= AsusACPI.MinGPUTemp && gpuTemp <= AsusACPI.MaxGPUTemp;
++}
++
++public static class GpuPowerCapability
++{
++    public readonly record struct Result(
++        bool BasePositive,
++        bool PowerResponds,
++        bool RangeEstablished,
++        int? AdditionalMinimum,
++        int? AdditionalMaximum,
++        int? MeasuredMaxLimit,
++        int? RangeLimit,
++        string RangeSource,
++        DecodedRead BaseRead,
++        DecodedRead PowerRead)
++    {
++        public static Result Unavailable { get; } = new(
++            false, false, false, null, null, null, null, "unavailable", default, default);
++    }
++
++    public static bool TransportOk(DecodedRead read)
++        => read.IoctlSucceeded && read.BytesReturned >= 4 && read.Buffer != null && read.Buffer.Length >= 4;
++
++    public static Result Evaluate(DecodedRead gpuBase, DecodedRead gpuPower, int? measuredMaxLimit, int? fallbackMaxLimit)
++    {
++        bool basePositive = TransportOk(gpuBase) && gpuBase.Decoded > 0;
++        bool powerResponds = TransportOk(gpuPower) && gpuPower.Decoded >= 0;
++        if (basePositive && TryAdditional(gpuBase.Decoded, measuredMaxLimit, out int measuredAdditional))
++        {
++            return new Result(
++                true, powerResponds, true,
++                AsusACPI.MinGPUPower, measuredAdditional, measuredMaxLimit, measuredMaxLimit, "nvidia-smi",
++                gpuBase, gpuPower);
++        }
++
++        if (basePositive && TryAdditional(gpuBase.Decoded, fallbackMaxLimit, out int fallbackAdditional))
++        {
++            return new Result(
++                true, powerResponds, true,
++                AsusACPI.MinGPUPower, fallbackAdditional, measuredMaxLimit, fallbackMaxLimit, "model-fallback",
++                gpuBase, gpuPower);
++        }
++
++        return new Result(
++            basePositive, powerResponds, false, null, null, measuredMaxLimit, null, "unavailable",
++            gpuBase, gpuPower);
++    }
++
++    static bool TryAdditional(int gpuBase, int? limit, out int additional)
++    {
++        additional = 0;
++        if (limit is not int reported) return false;
++        additional = GpuPowerLimit.AdditionalMaximum(gpuBase, reported);
++        return additional >= AsusACPI.MinGPUPower;
++    }
++}
++
++public static class GpuControlPresentation
++{
++    public const string CapabilityUnavailableText =
++        "GPU power capability is unavailable because GPU_BASE is not positive. No watt range is shown.";
++    public const string RangeUnavailableText =
++        "GPU power range cannot be established from the current readings. No watt value is shown.";
++    public const string WattUnavailableLabel = "Unavailable";
++
++    public static string BuildVersion { get; } =
++        Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
++        ?? "unknown";
++
++    public readonly record struct Decision(
++        bool PageVisible,
++        bool CpuTdpEnabled,
++        bool GpuPowerVisible,
++        bool GpuPowerEnabled,
++        bool GpuBoostVisible,
++        bool GpuBoostEnabled,
++        bool GpuTempVisible,
++        bool GpuTempEnabled,
++        bool ClockOffsetVisible,
++        bool ClockLimitVisible,
++        string? Notice,
++        string Reason,
++        bool ShowWattValue,
++        string Diagnostic);
++
++    public readonly record struct BoundControls(
++        bool PageVisible,
++        bool PowerRowVisible,
++        bool PowerEnabled,
++        bool BoostRowVisible,
++        bool BoostEnabled,
++        bool TempRowVisible,
++        bool TempEnabled,
++        bool ClockOffsetVisible,
++        bool ClockLimitVisible,
++        bool NoticeVisible,
++        string Notice,
++        string PowerLabel,
++        string Diagnostic,
++        bool ApplyLimitsEnabled);
++
++    public static Decision Decide(
++        XgDockSnapshot snap,
++        bool admissionClosed,
++        bool mitigationEnabled,
++        bool nvidiaController,
++        GpuPowerCapability.Result power,
++        bool gpuBoostSupported,
++        bool gpuTempSupported,
++        bool clockOffsetSupported,
++        bool gpuEco,
++        string? initFault,
++        string? buildVersion = null)
++    {
++        bool connected = snap.HasSample && XgDockClassifier.Classify(snap.Connected) == XgValueClass.One;
++        bool writesOpen = mitigationEnabled
++            ? snap.HasSample && snap.State == XgDockState.Inactive && !admissionClosed
++            : snap.State != XgDockState.Active;
++        bool ecoHidesPage = gpuEco && !(mitigationEnabled && connected);
++        bool pageVisible = !ecoHidesPage && (mitigationEnabled ? nvidiaController || connected : nvidiaController);
++        bool keepPowerRow = mitigationEnabled && connected;
++        bool powerVisible = pageVisible && (keepPowerRow || power.BasePositive);
++        bool wattKnown = power.BasePositive && power.RangeEstablished;
++        bool powerEnabled = powerVisible && writesOpen && wattKnown;
++
++        string reason;
++        string? notice;
++        if (!pageVisible)
++        {
++            reason = "page_hidden";
++            notice = null;
++        }
++        else if (!writesOpen)
++        {
++            reason = "locked";
++            notice = XgMitigation.GpuLimitsLockedText;
++        }
++        else if (!power.BasePositive)
++        {
++            reason = "gpu_base_unavailable";
++            notice = CapabilityUnavailableText;
++        }
++        else if (!power.RangeEstablished)
++        {
++            reason = "range_unavailable";
++            notice = RangeUnavailableText;
++        }
++        else
++        {
++            reason = "editable";
++            notice = null;
++        }
++
++        var decision = new Decision(
++            pageVisible,
++            writesOpen,
++            powerVisible,
++            powerEnabled,
++            pageVisible && gpuBoostSupported,
++            pageVisible && gpuBoostSupported && writesOpen,
++            pageVisible && gpuTempSupported,
++            pageVisible && gpuTempSupported && writesOpen,
++            pageVisible && nvidiaController && clockOffsetSupported && writesOpen,
++            pageVisible && nvidiaController && writesOpen,
++            notice,
++            reason,
++            wattKnown,
++            "");
++        return decision with
++        {
++            Diagnostic = Diagnostic(buildVersion ?? BuildVersion, decision, power, snap, admissionClosed, gpuEco, initFault)
++        };
++    }
++
++    public static BoundControls Bind(Decision decision, string wattLabel)
++    {
++        return new BoundControls(
++            decision.PageVisible,
++            decision.GpuPowerVisible,
++            decision.GpuPowerEnabled,
++            decision.GpuBoostVisible,
++            decision.GpuBoostEnabled,
++            decision.GpuTempVisible,
++            decision.GpuTempEnabled,
++            decision.ClockOffsetVisible,
++            decision.ClockLimitVisible,
++            decision.Notice is not null,
++            decision.Notice ?? "",
++            decision.ShowWattValue ? wattLabel : WattUnavailableLabel,
++            decision.Diagnostic,
++            decision.GpuPowerEnabled || decision.GpuBoostEnabled || decision.GpuTempEnabled);
++    }
++
++    public static string Diagnostic(
++        string build,
++        Decision decision,
++        GpuPowerCapability.Result power,
++        XgDockSnapshot snap,
++        bool admissionClosed,
++        bool gpuEco,
++        string? initFault)
++    {
++        string page = decision.PageVisible ? "visible" : "hidden";
++        string slider = (decision.GpuPowerVisible ? "visible" : "hidden")
++            + "/"
++            + (decision.GpuPowerEnabled ? "enabled" : "disabled");
++        string range = power.RangeEstablished
++            ? $"{power.RangeSource} max={power.RangeLimit} additional={power.AdditionalMaximum} measured={(power.MeasuredMaxLimit?.ToString() ?? "none")}"
++            : power.MeasuredMaxLimit is int measured ? $"unavailable measured={measured}" : "unavailable";
++        return "GPU power UI"
++            + " build=" + build
++            + " page=" + page
++            + " slider=" + slider
++            + " reason=" + decision.Reason
++            + " base=" + power.BaseRead
++            + " power=" + power.PowerRead
++            + " powerResponds=" + (power.PowerResponds ? "1" : "0")
++            + " range=" + range
++            + " dock=" + snap.State
++            + " sample=" + (snap.HasSample ? "1" : "0")
++            + " admission=" + (admissionClosed ? "closed" : "open")
++            + " eco=" + (gpuEco ? "1" : "0")
++            + " init=" + (string.IsNullOrEmpty(initFault) ? "none" : initFault);
++    }
++}
+diff --git a/app/Mode/ModeControl.cs b/app/Mode/ModeControl.cs
+index 80746cb..16b9885 100644
+--- a/app/Mode/ModeControl.cs
++++ b/app/Mode/ModeControl.cs
+@@ -105,7 +105,8 @@ namespace GHelper.Mode
+         {
+             ResetRyzen();
+ 
+-            Program.acpi.SetPerformanceMode(Modes.GetCurrentBase());
++            int status = Program.acpi.SetPerformanceMode(Modes.GetCurrentBase());
++            if (status == XgMitigation.Suppressed) return;
+ 
+             // Default power mode
+             AppConfig.RemoveMode("powermode");
+@@ -117,8 +118,22 @@ namespace GHelper.Mode
+             Program.toast.RunToast(Modes.GetCurrentName(), SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Online ? ToastIcon.Charger : ToastIcon.Battery);
+         }
+ 
+-        public void SetPerformanceMode(int mode = -1, bool notify = false)
++        public bool SetPerformanceMode(int mode = -1, bool notify = false)
+         {
++            using (var lease = XgMitigation.Shared.Enter("SetPerformanceMode", "DEVS", XgOp.Profile))
++            {
++                if (!lease.Allowed)
++                {
++                    settings.ShowMode(Modes.GetCurrent());
++                    return false;
++                }
++                if (!lease.Enforced && Program.acpi.IsXGActive())
++                {
++                    Logger.WriteLine("XG Mobile is active. Performance profile was not written.");
++                    settings.ShowMode(Modes.GetCurrent());
++                    return false;
++                }
++            }
+ 
+             int oldMode = Modes.GetCurrent();
+             if (mode < 0) mode = oldMode;
+@@ -201,6 +216,7 @@ namespace GHelper.Mode
+                     PowerNative.SetCPUBoost(AppConfig.GetMode("auto_boost"));
+ 
+             settings.FansInit();
++            return true;
+         }
+ 
+ 
+@@ -208,7 +224,8 @@ namespace GHelper.Mode
+         {
+             modeToggleTimer.Stop();
+             Logger.WriteLine($"Hotkey mode: {Modes.GetCurrent()}");
+-            SetPerformanceMode();
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                SetPerformanceMode();
+ 
+         }
+ 
+@@ -236,33 +253,43 @@ namespace GHelper.Mode
+             {
+ 
+                 bool xgmFan = false;
+-                if (AppConfig.Is("xgm_fan"))
++                bool xgmActive = Program.acpi.IsXGActive();
++                if (xgmActive || AppConfig.Is("xgm_fan"))
+                 {
+-                    XGM.SetFan(AppConfig.GetFanConfig(AsusFan.XGM));
+-                    xgmFan = Program.acpi.IsXGConnected();
++                    byte[] xgmCurve = AppConfig.GetFanConfig(AsusFan.XGM);
++                    if (AppConfig.Is("xgm_fan") && !AsusACPI.IsInvalidCurve(xgmCurve))
++                        XGM.SetFan(xgmCurve);
++                    else if (xgmActive)
++                        XGM.Reset();
++
++                    if (!xgmActive)
++                        xgmFan = Program.acpi.IsXGConnected();
+                 }
+ 
++                using var fanLease = XgMitigation.Shared.Enter("AutoFans", "DEVS", XgOp.Fan);
++                if (fanLease.Allowed)
++                {
+                 int cpuResult = Program.acpi.SetFanCurve(AsusFan.CPU, AppConfig.GetFanConfig(AsusFan.CPU));
+-                int gpuResult = Program.acpi.SetFanCurve(AsusFan.GPU, AppConfig.GetFanConfig(AsusFan.GPU));
++                int gpuResult = xgmActive ? 1 : Program.acpi.SetFanCurve(AsusFan.GPU, AppConfig.GetFanConfig(AsusFan.GPU));
+ 
+                 if (AppConfig.Is("mid_fan"))
+                     Program.acpi.SetFanCurve(AsusFan.Mid, AppConfig.GetFanConfig(AsusFan.Mid));
+ 
+ 
+                 // Alternative way to set fan curve
+-                if (cpuResult != 1 || gpuResult != 1)
++                if (XgMitigation.FanFallbackIsHardwareRejection(cpuResult, gpuResult))
+                 {
+                     cpuResult = Program.acpi.SetFanRange(AsusFan.CPU, AppConfig.GetFanConfig(AsusFan.CPU));
+-                    gpuResult = Program.acpi.SetFanRange(AsusFan.GPU, AppConfig.GetFanConfig(AsusFan.GPU));
++                    gpuResult = xgmActive ? 1 : Program.acpi.SetFanRange(AsusFan.GPU, AppConfig.GetFanConfig(AsusFan.GPU));
+ 
+                     // Something went wrong, resetting to default profile
+-                    if (cpuResult != 1 || gpuResult != 1)
++                    if (XgMitigation.FanFallbackIsHardwareRejection(cpuResult, gpuResult))
+                     {
+                         Program.acpi.DeviceSet(AsusACPI.PerformanceMode, Modes.GetCurrentBase(), "Reset Mode");
+                         settings.LabelFansResult("Model doesn't support custom fan curves");
+                     }
+                 }
+-                else
++                else if (cpuResult == 1 && gpuResult == 1)
+                 {
+                     settings.LabelFansResult("");
+                     customFans = true;
+@@ -274,7 +301,7 @@ namespace GHelper.Mode
+                     Program.acpi.SetFanHysteresis(hystUp, hystDown);
+ 
+                 // force set PPTs for missbehaving bios on FX507/517 series
+-                if ((AppConfig.IsPowerRequired() || xgmFan) && !AppConfig.IsApplyPower())
++                if (!xgmActive && (AppConfig.IsPowerRequired() || xgmFan) && !AppConfig.IsApplyPower())
+                 {
+                     Task.Run(async () =>
+                     {
+@@ -283,6 +310,7 @@ namespace GHelper.Mode
+                         Program.acpi.DeviceSet(AsusACPI.PPT_APUA3, 80, "PowerLimit Fix A3");
+                     });
+                 }
++                }
+ 
+             } else
+             {
+@@ -295,9 +323,6 @@ namespace GHelper.Mode
+ 
+         public void AutoPower(bool launchAsAdmin = false)
+         {
+-
+-            customPower = 0;
+-
+             bool applyPower = AppConfig.IsApplyPower();
+             bool applyFans = AppConfig.IsApplyFans();
+ 
+@@ -331,9 +356,6 @@ namespace GHelper.Mode
+             if (!_ryzenPower) return;
+             if (!AppConfig.IsApplyPower()) return;
+ 
+-            var smu = GetSmu();
+-            if (smu == null) return;
+-
+             int limit_total = AppConfig.GetMode("limit_total");
+             int limit_slow = AppConfig.GetMode("limit_slow", limit_total);
+             int limit_fast = AppConfig.GetMode("limit_fast", limit_slow);
+@@ -341,13 +363,27 @@ namespace GHelper.Mode
+             if (limit_total > AsusACPI.MaxTotal) return;
+             if (limit_total < AsusACPI.MinTotal) return;
+ 
++            using var ryzenLease = XgMitigation.Shared.Enter("SetRyzenPower", "SMU.SetAllLimits", XgOp.Power);
++            if (!ryzenLease.Allowed) return;
++            if (!ryzenLease.Enforced && Program.acpi.IsXGActive()) return;
++
++            var smu = GetSmu();
++            if (smu == null) return;
++
+             smu.SetAllLimits(limit_total, limit_fast, limit_slow,
+                 out SmuStatus stapm, out SmuStatus fast, out SmuStatus slow);
++            if (ryzenLease.Enforced)
++                XgMitigation.Shared.LogCompleted(ryzenLease, "SetRyzenPower", "SMU.SetAllLimits", $"{limit_total}/{limit_fast}/{limit_slow}", $"{stapm}/{fast}/{slow}");
+             if (init) Logger.WriteLine($"STAPM: {limit_total}W {stapm} | SLOW: {limit_slow}W {slow} | FAST: {limit_fast}W {fast}");
+         }
+ 
+         public void SetPower(bool launchAsAdmin = false)
+         {
++            if (!XgMitigation.Shared.Enabled && Program.acpi.IsXGActive())
++            {
++                Logger.WriteLine("XG Mobile is active. CPU power limit was not written.");
++                return;
++            }
+ 
+             bool allAMD = Program.acpi.IsAllAmdPPT();
+             bool isAMD = CpuInfo.IsAMD;
+@@ -371,12 +407,15 @@ namespace GHelper.Mode
+             if (limit_slow > AsusACPI.MaxTotal) return;
+             if (limit_slow < AsusACPI.MinTotal) return;
+ 
+-            // SPL and SPPT
++            // SPL and SPPT. A3, A0, and the optional B0/C1 write share one admission.
+             if (Program.acpi.IsSupported(AsusACPI.PPT_APUA0))
+             {
+-                Program.acpi.DeviceSet(AsusACPI.PPT_APUA3, limit_total, "PowerLimit A3");
+-                Program.acpi.DeviceSet(AsusACPI.PPT_APUA0, limit_slow, "PowerLimit A0");
+-                customPower = limit_total;
++                bool writeFast = !allAMD && isAMD && Program.acpi.IsSupported(AsusACPI.PPT_APUC1);
++                int written = XgMitigation.Shared.ApplyCpuPowerWrites(
++                    limit_total, limit_slow, allAMD, limit_cpu, writeFast, limit_fast,
++                    (id, value, name) => Program.acpi.DeviceSet(id, value, name));
++                if (written == XgMitigation.Suppressed) return;
++                customPower = allAMD ? limit_cpu : limit_total;
+             }
+             else if (isAMD)
+             {
+@@ -389,16 +428,16 @@ namespace GHelper.Mode
+                     ProcessHelper.RunAsAdmin("cpu");
+                     return;
+                 }
+-            }
+ 
+-            if (allAMD) // CPU limit all amd models
+-            {
+-                Program.acpi.DeviceSet(AsusACPI.PPT_CPUB0, limit_cpu, "PowerLimit B0");
+-                customPower = limit_cpu;
+-            }
+-            else if (isAMD && Program.acpi.IsSupported(AsusACPI.PPT_APUC1)) // FPPT boost for non all-amd models
+-            {
+-                Program.acpi.DeviceSet(AsusACPI.PPT_APUC1, limit_fast, "PowerLimit C1");
++                if (allAMD)
++                {
++                    int cpuResult = Program.acpi.DeviceSet(AsusACPI.PPT_CPUB0, limit_cpu, "PowerLimit B0");
++                    if (cpuResult != XgMitigation.Suppressed) customPower = limit_cpu;
++                }
++                else if (Program.acpi.IsSupported(AsusACPI.PPT_APUC1))
++                {
++                    Program.acpi.DeviceSet(AsusACPI.PPT_APUC1, limit_fast, "PowerLimit C1");
++                }
+             }
+ 
+             SetModeLabel();
+@@ -407,6 +446,12 @@ namespace GHelper.Mode
+ 
+         public void SetCrossPower()
+         {
++            if (!XgMitigation.Shared.Enabled && Program.acpi.IsXGActive())
++            {
++                Logger.WriteLine("XG Mobile is active. CPU power limit was not written.");
++                return;
++            }
++
+             int gpucpu = AppConfig.GetMode("limit_gpucpu");
+             int crossload = AppConfig.GetMode("limit_crossload");
+             int cputemp = AppConfig.GetMode("limit_cputemp");
+@@ -423,8 +468,19 @@ namespace GHelper.Mode
+ 
+         public void SetGPUClocks(bool launchAsAdmin = true, bool reset = false)
+         {
++            bool enforced = XgMitigation.Shared.Enabled;
++            if (!enforced && Program.acpi.IsXGActive())
++            {
++                Logger.WriteLine("XG Mobile is active. GPU clocks were not written.");
++                return;
++            }
++
+             Task.Run(() =>
+             {
++                using var clockLease = enforced
++                    ? XgMitigation.Shared.Enter("SetGPUClocks", "NvAPI", XgOp.Clocks)
++                    : XgMitigation.Lease.Bypass();
++                if (!clockLease.Allowed) return;
+ 
+                 int core = AppConfig.GetMode("gpu_core");
+                 int memory = AppConfig.GetMode("gpu_memory");
+@@ -444,10 +500,14 @@ namespace GHelper.Mode
+                 {
+                     int statusClocks = nvControl.SetClocks(core, memory);
+                     int statusLimit = nvControl.SetMaxGPUClock(clock_limit);
++                    if (enforced)
++                        XgMitigation.Shared.LogCompleted(clockLease, "SetGPUClocks", "NvAPI", "clocks", $"clocks={statusClocks} limit={statusLimit}");
+                     if ((statusLimit != 0 || statusClocks != 0) && launchAsAdmin) ProcessHelper.RunAsAdmin("gpu");
+                 }
+                 catch (Exception ex)
+                 {
++                    if (enforced)
++                        XgMitigation.Shared.LogFailed(clockLease, "SetGPUClocks", "NvAPI", "clocks", ex.GetType().Name);
+                     Logger.WriteLine("Clocks Error:" + ex.ToString());
+                 }
+ 
+@@ -455,28 +515,29 @@ namespace GHelper.Mode
+             });
+         }
+ 
+-        public void SetGPUPower()
++        public XgMitigation.GpuLimitApplyResult SetGPUPower()
+         {
++            if (!XgMitigation.Shared.Enabled && Program.acpi.IsXGActive())
++            {
++                Logger.WriteLine("XG Mobile is active. GPU power and temperature were not written.");
++                return new XgMitigation.GpuLimitApplyResult(true, 0) { PowerDenied = true, TempDenied = true };
++            }
+ 
+             int gpu_boost = AppConfig.GetMode("gpu_boost");
+             int gpu_temp = AppConfig.GetMode("gpu_temp");
+             int gpu_power = AppConfig.GetMode("gpu_power");
+-
+-            int boostResult = -1;
+-
+-            if (gpu_power >= AsusACPI.MinGPUPower && gpu_power <= AsusACPI.MaxGPUPower && Program.acpi.IsSupported(AsusACPI.GPU_POWER))
+-                Program.acpi.DeviceSet(AsusACPI.GPU_POWER, gpu_power, "PowerLimit TGP (GPU VAR)");
+-
+-            if (gpu_boost >= AsusACPI.MinGPUBoost && gpu_boost <= AsusACPI.MaxGPUBoost && Program.acpi.IsSupported(AsusACPI.PPT_GPUC0))
+-                boostResult = Program.acpi.DeviceSet(AsusACPI.PPT_GPUC0, gpu_boost, "PowerLimit C0 (GPU BOOST)");
+-
+-            if (gpu_temp >= AsusACPI.MinGPUTemp && gpu_temp <= AsusACPI.MaxGPUTemp && Program.acpi.IsSupported(AsusACPI.PPT_GPUC2))
+-                Program.acpi.DeviceSet(AsusACPI.PPT_GPUC2, gpu_temp, "PowerLimit C2 (GPU TEMP)");
+-
+-            // Fallback
+-            if (boostResult == 0)
+-                Program.acpi.DeviceSet(AsusACPI.PPT_GPUC0, gpu_boost, "PowerLimit C0");
+-
++            bool writePower = GpuPowerLimit.PowerInRange(gpu_power) && Program.acpi.IsSupported(AsusACPI.GPU_POWER);
++            bool writeBoost = GpuPowerLimit.BoostInRange(gpu_boost) && Program.acpi.IsSupported(AsusACPI.PPT_GPUC0);
++            bool writeTemp = GpuPowerLimit.TempInRange(gpu_temp) && Program.acpi.IsSupported(AsusACPI.PPT_GPUC2);
++
++            var result = XgMitigation.Shared.ApplySupportedGpuLimits(
++                writePower, gpu_power,
++                writeBoost, gpu_boost,
++                writeTemp, gpu_temp,
++                (device, value, name) => Program.acpi.DeviceSet(device, value, name));
++            if (result.Suppressed && result.Writes == 0)
++                Logger.WriteLine("GPU power and temperature were not written. " + XgMitigation.GpuLimitsLockedText);
++            return result;
+         }
+ 
+         public SmuStatus? SetCPUTemp(int cpuTemp, bool log = false)
+@@ -484,9 +545,14 @@ namespace GHelper.Mode
+             if (cpuTemp < CpuInfo.MinTemp || cpuTemp > CpuInfo.DefaultTemp) return null;
+             if (cpuTemp == CpuInfo.DefaultTemp && _cpuTemp == CpuInfo.DefaultTemp) return null;
+ 
++            using var tempLease = XgMitigation.Shared.Enter("SetCPUTemp", "SMU.SetThm", XgOp.Thermal);
++            if (!tempLease.Allowed) return null;
++
+             var smu = GetSmu();
+             if (smu == null) return null;
+             SmuStatus status = smu.SetThm(cpuTemp);
++            if (tempLease.Enforced)
++                XgMitigation.Shared.LogCompleted(tempLease, "SetCPUTemp", "SMU.SetThm", cpuTemp.ToString(), status.ToString());
+             if (log) Logger.WriteLine($"CPU Temp: {cpuTemp}°C {status}");
+             if (status == SmuStatus.OK) _cpuTemp = cpuTemp;
+             return status;
+@@ -495,29 +561,35 @@ namespace GHelper.Mode
+         public void SetUV(int cpuUV)
+         {
+             if (!CpuInfo.IsSupportedUV()) return;
++            if (cpuUV < CpuInfo.MinCPUUV || cpuUV > CpuInfo.MaxCPUUV) return;
+ 
+-            if (cpuUV >= CpuInfo.MinCPUUV && cpuUV <= CpuInfo.MaxCPUUV)
+-            {
+-                var smu = GetSmu();
+-                if (smu == null) return;
+-                SmuStatus status = smu.SetCoAll(cpuUV);
+-                Logger.WriteLine($"UV: {cpuUV} {status}");
+-                if (status == SmuStatus.OK) _cpuUV = cpuUV;
+-            }
++            using var lease = XgMitigation.Shared.Enter("SetUV", "SMU.SetCoAll", XgOp.Uv);
++            if (!lease.Allowed) return;
++
++            var smu = GetSmu();
++            if (smu == null) return;
++            SmuStatus status = smu.SetCoAll(cpuUV);
++            if (lease.Enforced)
++                XgMitigation.Shared.LogCompleted(lease, "SetUV", "SMU.SetCoAll", cpuUV.ToString(), status.ToString());
++            Logger.WriteLine($"UV: {cpuUV} {status}");
++            if (status == SmuStatus.OK) _cpuUV = cpuUV;
+         }
+ 
+         public void SetUViGPU(int igpuUV)
+         {
+             if (!CpuInfo.IsSupportedUViGPU()) return;
++            if (igpuUV < CpuInfo.MinIGPUUV || igpuUV > CpuInfo.MaxIGPUUV) return;
+ 
+-            if (igpuUV >= CpuInfo.MinIGPUUV && igpuUV <= CpuInfo.MaxIGPUUV)
+-            {
+-                var smu = GetSmu();
+-                if (smu == null) return;
+-                SmuStatus status = smu.SetCoGfx(igpuUV);
+-                Logger.WriteLine($"iGPU UV: {igpuUV} {status}");
+-                if (status == SmuStatus.OK) _igpuUV = igpuUV;
+-            }
++            using var lease = XgMitigation.Shared.Enter("SetUViGPU", "SMU.SetCoGfx", XgOp.Uv);
++            if (!lease.Allowed) return;
++
++            var smu = GetSmu();
++            if (smu == null) return;
++            SmuStatus status = smu.SetCoGfx(igpuUV);
++            if (lease.Enforced)
++                XgMitigation.Shared.LogCompleted(lease, "SetUViGPU", "SMU.SetCoGfx", igpuUV.ToString(), status.ToString());
++            Logger.WriteLine($"iGPU UV: {igpuUV} {status}");
++            if (status == SmuStatus.OK) _igpuUV = igpuUV;
+         }
+ 
+         public string SetRyzen(bool launchAsAdmin = false)
+@@ -528,15 +600,19 @@ namespace GHelper.Mode
+                 return string.Empty;
+             }
+ 
+-            var smu = GetSmu();
+-            if (smu == null) return string.Empty;
+-
+             var lines = new System.Text.StringBuilder();
++            int cpuTemp = AppConfig.GetMode("cpu_temp");
++            using (var uvLease = XgMitigation.Shared.Enter("SetRyzen", "SMU.SetCo", XgOp.Uv))
++            {
++            if (uvLease.Allowed)
++            {
++            var smu = GetSmu();
++            if (smu != null)
++            {
+             try
+             {
+                 int cpuUV   = AppConfig.GetMode("cpu_uv",   0);
+                 int igpuUV  = AppConfig.GetMode("igpu_uv",  0);
+-                int cpuTemp = AppConfig.GetMode("cpu_temp");
+                 string? cpuUVCores = AppConfig.GetModeString("cpu_uv_cores");
+ 
+                 if (CpuInfo.IsSupportedUV() && cpuUVCores is not null)
+@@ -569,7 +645,20 @@ namespace GHelper.Mode
+                     if (s == SmuStatus.OK) _igpuUV = igpuUV;
+                     lines.AppendLine($"iGPU UV {igpuUV}: {s}");
+                 }
++            }
++            catch (Exception ex)
++            {
++                Logger.WriteLine("UV Error: " + ex.ToString());
++            }
++
++            if (uvLease.Enforced)
++                XgMitigation.Shared.LogCompleted(uvLease, "SetRyzen", "SMU.SetCo", "curve", lines.ToString());
++            }
++            }
++            }
+ 
++            try
++            {
+                 SmuStatus? tempStatus = SetCPUTemp(cpuTemp, true);
+                 if (tempStatus.HasValue) lines.AppendLine($"CPU Temp {cpuTemp}°C: {tempStatus}");
+             }
+diff --git a/app/Mode/XgMitigation.cs b/app/Mode/XgMitigation.cs
+new file mode 100644
+index 0000000..8066af1
+--- /dev/null
++++ b/app/Mode/XgMitigation.cs
+@@ -0,0 +1,808 @@
++using System.Diagnostics;
++
++// RC71L mitigation. These ASUS IDs are ATKACPI DEVS/DSTS arguments.
++// A GPUXG command value is not treated as a readback, and no status-bit layout is inferred.
++
++public enum XgValueClass
++{
++    NotRead,
++    Zero,
++    One,
++    Other,
++    TransportFailed
++}
++
++public enum XgDockState
++{
++    Inactive,
++    Active,
++    Unknown,
++    Transitioning
++}
++
++[Flags]
++public enum XgOp
++{
++    None = 0,
++    Power = 1,
++    Fan = 2,
++    Profile = 4,
++    Uv = 8,
++    Thermal = 16,
++    Clocks = 32,
++    GpuThermal = 64,
++    CpuLimit = 128,
++}
++
++public readonly struct DecodedRead
++{
++    public bool IoctlSucceeded { get; init; }
++    public uint BytesReturned { get; init; }
++    public int Win32Error { get; init; }
++    public byte[]? Buffer { get; init; }
++
++    public int Raw => Buffer != null && Buffer.Length >= 4 ? BitConverter.ToInt32(Buffer, 0) : 0;
++    public int Decoded => Raw - 65536;
++
++    public override string ToString()
++    {
++        if (Buffer == null)
++            return "class=NotRead ioctl=not_called";
++        var cls = XgDockClassifier.Classify(this);
++        string raw = Buffer.Length >= 4 ? Raw.ToString("X8") : "-";
++        return $"class={cls} ioctl={(IoctlSucceeded ? "ok" : "fail")} bytes={BytesReturned} win32={Win32Error} raw=0x{raw} decoded={Decoded}";
++    }
++}
++
++public readonly struct DevsOutcome
++{
++    public int Result { get; init; }
++    public bool IoctlSucceeded { get; init; }
++    public uint BytesReturned { get; init; }
++    public int Win32Error { get; init; }
++}
++
++public readonly record struct XgDockSnapshot
++{
++    public XgDockState State { get; init; }
++    public DecodedRead Connected { get; init; }
++    public DecodedRead Activation { get; init; }
++    public DateTimeOffset Utc { get; init; }
++    public long MonoMs { get; init; }
++    public bool HasSample { get; init; }
++    public string Source { get; init; }
++
++    public bool BlocksMutations => State is XgDockState.Active or XgDockState.Unknown or XgDockState.Transitioning;
++
++    public static XgDockSnapshot Unsampled() => new()
++    {
++        State = XgDockState.Unknown,
++        Source = "unsampled",
++        Utc = DateTimeOffset.UtcNow,
++        MonoMs = Environment.TickCount64
++    };
++}
++
++public static class XgDockClassifier
++{
++    public static XgValueClass Classify(DecodedRead read)
++    {
++        if (!read.IoctlSucceeded || read.BytesReturned < 4 || read.Buffer == null || read.Buffer.Length < 4)
++            return XgValueClass.TransportFailed;
++        int decoded = BitConverter.ToInt32(read.Buffer, 0) - 65536;
++        if (decoded == 0) return XgValueClass.Zero;
++        if (decoded == 1) return XgValueClass.One;
++        return XgValueClass.Other;
++    }
++
++    // Established pairs only: decoded 0 and decoded 1. Any other successful value is Unknown.
++    public static XgDockSnapshot FromReads(DecodedRead connected, DecodedRead activation)
++    {
++        var c = Classify(connected);
++        var a = Classify(activation);
++        XgDockState state;
++        if (c is XgValueClass.TransportFailed or XgValueClass.Other || a is XgValueClass.TransportFailed or XgValueClass.Other)
++            state = XgDockState.Unknown;
++        else if (c == XgValueClass.One && a == XgValueClass.One)
++            state = XgDockState.Active;
++        else if (a == XgValueClass.One)
++            state = XgDockState.Unknown;
++        else
++            state = XgDockState.Inactive;
++
++        return new XgDockSnapshot
++        {
++            State = state,
++            Connected = connected,
++            Activation = activation,
++            Utc = DateTimeOffset.UtcNow,
++            MonoMs = Environment.TickCount64,
++            HasSample = true,
++            Source = "fresh_dsts"
++        };
++    }
++}
++
++public sealed class XgMitigation
++{
++    public const int Suppressed = -2;
++
++    public static readonly XgMitigation Shared = new();
++
++    // Profile writers: 0x00120075 performance mode, 0x00110019 alternate profile path, 0x00090031 optional status side write.
++    // GPUXG 0x00090019 is not in this set. Activation and ejection stay on RunLifecycle.
++    static readonly HashSet<uint> GuardedDevices = new()
++    {
++        AsusACPI.PerformanceMode,
++        AsusACPI.VivoBookMode,
++        AsusACPI.StatusMode,
++        (uint)AsusACPI.PPT_APUA0,
++        (uint)AsusACPI.PPT_EDCA1,
++        (uint)AsusACPI.PPT_TDCA2,
++        (uint)AsusACPI.PPT_APUA3,
++        (uint)AsusACPI.PPT_CPUB0,
++        (uint)AsusACPI.PPT_CPUB1,
++        (uint)AsusACPI.PPT_GPUCPU9C,
++        (uint)AsusACPI.PPT_TEMP9E,
++        (uint)AsusACPI.PPT_CROSS9F,
++        (uint)AsusACPI.PPT_GPUC0,
++        (uint)AsusACPI.PPT_APUC1,
++        (uint)AsusACPI.PPT_GPUC2,
++        AsusACPI.GPU_BASE,
++        AsusACPI.GPU_POWER,
++        AsusACPI.DevsCPUFan,
++        AsusACPI.DevsGPUFan,
++        AsusACPI.DevsCPUFanCurve,
++        AsusACPI.DevsGPUFanCurve,
++        AsusACPI.DevsMidFanCurve,
++        AsusACPI.FanHysteresis,
++    };
++
++    public const XgOp ProfileApply = XgOp.Profile | XgOp.Fan | XgOp.Power | XgOp.Clocks | XgOp.Thermal | XgOp.GpuThermal | XgOp.CpuLimit;
++    public const XgOp UvApply = XgOp.Uv | XgOp.Thermal;
++    public const XgOp ResetApply = ProfileApply | XgOp.Uv;
++
++    readonly object gate = new();
++    int transition;
++    int transitionPending;
++    int mutations;
++    int transitionWaits;
++    long epoch;
++    bool automaticSuspended;
++    XgDockSnapshot last = XgDockSnapshot.Unsampled();
++
++    [ThreadStatic] static XgMitigation? ticketOwner;
++    [ThreadStatic] static int ticketDepth;
++    [ThreadStatic] static XgDockSnapshot ticketSnapshot;
++    static readonly AsyncLocal<XgOp> explicitOps = new();
++
++    public bool Enabled { get; private set; }
++    public Func<XgDockSnapshot>? ReadState { get; set; }
++    public Action<string> Write { get; set; } = Logger.WriteLine;
++    public Func<DateTimeOffset> UtcNow { get; set; } = () => DateTimeOffset.UtcNow;
++    public Func<long> MonotonicMs { get; set; } = () => Environment.TickCount64;
++    public ManualResetEventSlim? TransitionWaiting { get; set; }
++
++    public static bool IsGuardedDevice(uint deviceId) => GuardedDevices.Contains(deviceId);
++    public static XgOp ExplicitOperations => explicitOps.Value;
++
++    public static XgOp OperationForDevice(uint deviceId)
++    {
++        if (deviceId == AsusACPI.PerformanceMode || deviceId == AsusACPI.VivoBookMode || deviceId == AsusACPI.StatusMode)
++            return XgOp.Profile;
++        if (deviceId == AsusACPI.DevsCPUFan || deviceId == AsusACPI.DevsGPUFan ||
++            deviceId == AsusACPI.DevsCPUFanCurve || deviceId == AsusACPI.DevsGPUFanCurve ||
++            deviceId == AsusACPI.DevsMidFanCurve || deviceId == AsusACPI.FanHysteresis)
++            return XgOp.Fan;
++        if (deviceId == (uint)AsusACPI.PPT_TEMP9E)
++            return XgOp.CpuLimit;
++        if (deviceId == (uint)AsusACPI.PPT_GPUC2)
++            return XgOp.GpuThermal;
++        return XgOp.Power;
++    }
++
++    public static bool FanFallbackIsHardwareRejection(int cpuResult, int gpuResult)
++        => cpuResult != Suppressed && gpuResult != Suppressed && (cpuResult != 1 || gpuResult != 1);
++
++    public bool InTransition
++    {
++        get { lock (gate) return transition > 0; }
++    }
++
++    public int TransitionWaits
++    {
++        get { lock (gate) return transitionWaits; }
++    }
++
++    public bool AdmissionClosed
++    {
++        get { lock (gate) return transition > 0 || transitionPending > 0; }
++    }
++
++    public bool AwaitingExplicit
++    {
++        get { lock (gate) return automaticSuspended; }
++    }
++
++    public void Enable(Func<XgDockSnapshot> read)
++    {
++        ReadState = read;
++        Enabled = true;
++    }
++
++    public static ExplicitScope Explicit(XgOp operations)
++    {
++        var previous = explicitOps.Value;
++        explicitOps.Value = previous | operations;
++        return new ExplicitScope(previous);
++    }
++
++    public bool ControlsLocked()
++    {
++        if (!Enabled) return false;
++        return Peek().BlocksMutations;
++    }
++
++    public XgDockSnapshot Peek()
++    {
++        if (!Enabled) return XgDockSnapshot.Unsampled();
++        lock (gate)
++        {
++            if (transition > 0) return TransitionSnapshot();
++        }
++        var fresh = ReadFresh();
++        lock (gate)
++        {
++            if (transition > 0) return TransitionSnapshot();
++            last = fresh;
++            return fresh;
++        }
++    }
++
++    public Lease Enter(string caller, string api, XgOp op, uint? deviceId = null, string? requested = null)
++    {
++        if (!Enabled) return Lease.Bypass();
++        // Nested calls belong to the admission already counted. They must not wait on a transition.
++        if (ticketDepth > 0 && ticketOwner == this)
++            return Lease.Nested(ticketSnapshot);
++
++        long seen;
++        lock (gate)
++        {
++            if (transition > 0 || transitionPending > 0)
++            {
++                automaticSuspended = true;
++                var snap = TransitionSnapshot();
++                Emit("suppressed", caller, api, deviceId, requested ?? "", "not_sent", snap, false);
++                return Lease.Deny(snap);
++            }
++            seen = epoch;
++        }
++
++        var fresh = ReadFresh();
++        lock (gate)
++        {
++            if (transition > 0 || transitionPending > 0 || epoch != seen)
++            {
++                automaticSuspended = true;
++                var snap = transition > 0 || transitionPending > 0 ? TransitionSnapshot() : fresh;
++                Emit("suppressed", caller, api, deviceId, requested ?? "", "not_sent concurrent_state_change", snap, false);
++                return Lease.Deny(snap);
++            }
++
++            last = fresh;
++            bool requestedByUser = op != XgOp.None && (explicitOps.Value & op) == op;
++            if (fresh.BlocksMutations)
++            {
++                automaticSuspended = true;
++                Emit("suppressed", caller, api, deviceId, requested ?? "", "not_sent", fresh, false);
++                return Lease.Deny(fresh);
++            }
++            if (automaticSuspended && !requestedByUser)
++            {
++                Emit("suppressed", caller, api, deviceId, requested ?? "", "not_sent explicit_apply_required", fresh, false);
++                return Lease.Deny(fresh);
++            }
++
++            mutations++;
++            ticketOwner = this;
++            ticketDepth++;
++            ticketSnapshot = fresh;
++            return Lease.Owned(this, fresh);
++        }
++    }
++
++    public void End()
++    {
++        lock (gate)
++        {
++            if (ticketOwner != this || ticketDepth <= 0) return;
++            ticketDepth--;
++            if (ticketDepth != 0) return;
++            ticketOwner = null;
++            if (mutations > 0) mutations--;
++            Monitor.PulseAll(gate);
++        }
++    }
++
++    public void EnterTransition(string caller)
++    {
++        lock (gate)
++        {
++            transitionPending++;
++            try
++            {
++                while (mutations > 0)
++                {
++                    transitionWaits++;
++                    TransitionWaiting?.Set();
++                    Monitor.Wait(gate);
++                }
++                transition++;
++                epoch++;
++                last = TransitionSnapshot();
++            }
++            finally
++            {
++                transitionPending--;
++            }
++        }
++        if (Enabled)
++            Emit("transition", caller, "transition", AsusACPI.GPUXG, "begin", "flag_set", TransitionSnapshot(), false);
++    }
++
++    public void ExitTransition(string caller)
++    {
++        XgDockSnapshot cleared;
++        lock (gate)
++        {
++            if (transition > 0) transition--;
++            epoch++;
++            if (transition == 0) last = XgDockSnapshot.Unsampled();
++            cleared = last;
++            Monitor.PulseAll(gate);
++        }
++        if (Enabled)
++            Emit("transition", caller, "transition", AsusACPI.GPUXG, "end", "flag_cleared_no_sample", cleared, true);
++    }
++
++    public int RunGuarded(string caller, uint deviceId, string requested, Func<DevsOutcome> write)
++    {
++        if (!Enabled || !IsGuardedDevice(deviceId))
++            return write().Result;
++
++        using var lease = Enter(caller, "DEVS", OperationForDevice(deviceId), deviceId, requested);
++        if (!lease.Allowed) return Suppressed;
++
++        DevsOutcome outcome;
++        try
++        {
++            outcome = write();
++        }
++        catch (Exception ex)
++        {
++            Emit("failed", caller, "DEVS", deviceId, requested, "exception " + ex.GetType().Name, lease.Evidence, false);
++            throw;
++        }
++
++        string action = outcome.IoctlSucceeded ? "completed" : "failed";
++        Emit(action, caller, "DEVS", deviceId, requested,
++            $"devs={outcome.Result} ioctl={(outcome.IoctlSucceeded ? "ok" : "fail")} bytes={outcome.BytesReturned} win32={outcome.Win32Error}",
++            lease.Evidence, false);
++        return outcome.Result;
++    }
++
++    public int ApplyCpuPowerWrites(int total, int slow, bool writeCpu, int cpu, bool writeFast, int fast, Func<uint, int, string, int> write)
++    {
++        using var lease = Enter("SetPower", "DEVS", XgOp.Power);
++        if (!lease.Allowed) return Suppressed;
++
++        int sustained = write((uint)AsusACPI.PPT_APUA3, total, "PowerLimit A3");
++        int slowResult = write((uint)AsusACPI.PPT_APUA0, slow, "PowerLimit A0");
++        int extra = 1;
++        if (writeCpu) extra = write((uint)AsusACPI.PPT_CPUB0, cpu, "PowerLimit B0");
++        else if (writeFast) extra = write((uint)AsusACPI.PPT_APUC1, fast, "PowerLimit C1");
++
++        if (sustained == Suppressed || slowResult == Suppressed || extra == Suppressed)
++            return Suppressed;
++        return 1;
++    }
++
++    public const string GpuLimitsLockedText = "GPU limits are locked while XG Mobile is active or changing.";
++
++    public readonly record struct GpuLimitPresentation(bool Enabled, string? Explanation);
++    public readonly record struct GpuLimitApplyResult(bool Suppressed, int Writes)
++    {
++        public bool PowerDenied { get; init; }
++        public bool TempDenied { get; init; }
++    }
++
++    // Confirmed inactive, with no transition waiting or running. Unknown and failed reads stay closed.
++    public bool GpuLimitsOpen()
++    {
++        if (!Enabled) return true;
++        var snap = Peek();
++        return snap.HasSample && snap.State == XgDockState.Inactive && !AdmissionClosed;
++    }
++
++    public GpuLimitPresentation PresentGpuLimits(bool powerSupported, bool boostSupported, bool tempSupported)
++    {
++        bool any = powerSupported || boostSupported || tempSupported;
++        if (!any) return new GpuLimitPresentation(false, null);
++        if (!Enabled) return new GpuLimitPresentation(true, null);
++        bool open = GpuLimitsOpen();
++        return new GpuLimitPresentation(open, open ? null : GpuLimitsLockedText);
++    }
++
++    public GpuLimitApplyResult ApplySupportedGpuLimits(
++        bool writePower, int power,
++        bool writeBoost, int boost,
++        bool writeTemp, int temp,
++        Func<uint, int, string, int> write)
++    {
++        int writes = 0;
++        bool powerDenied = false;
++        bool tempDenied = false;
++        if (writePower || writeBoost)
++        {
++            using var gpuLease = Enter("SetGPUPower", "DEVS", XgOp.Power);
++            if (!gpuLease.Allowed) powerDenied = true;
++            else
++            {
++                if (writePower)
++                {
++                    write(AsusACPI.GPU_POWER, power, "PowerLimit TGP (GPU VAR)");
++                    writes++;
++                }
++                if (writeBoost)
++                {
++                    int boostResult = write((uint)AsusACPI.PPT_GPUC0, boost, "PowerLimit C0 (GPU BOOST)");
++                    writes++;
++                    if (boostResult == 0)
++                    {
++                        write((uint)AsusACPI.PPT_GPUC0, boost, "PowerLimit C0");
++                        writes++;
++                    }
++                }
++            }
++        }
++
++        if (writeTemp)
++        {
++            using var tempLease = Enter("SetGPUPower", "DEVS", XgOp.GpuThermal);
++            if (!tempLease.Allowed) tempDenied = true;
++            else
++            {
++                write((uint)AsusACPI.PPT_GPUC2, temp, "PowerLimit C2 (GPU TEMP)");
++                writes++;
++            }
++        }
++
++        return new GpuLimitApplyResult(powerDenied || tempDenied, writes)
++        {
++            PowerDenied = powerDenied,
++            TempDenied = tempDenied
++        };
++    }
++
++    public int RunLifecycle(string caller, uint deviceId, string requested, Func<DevsOutcome> write)
++    {
++        DevsOutcome outcome;
++        try
++        {
++            outcome = write();
++        }
++        catch (Exception ex)
++        {
++            if (Enabled)
++                Emit("failed", caller, "DEVS", deviceId, requested, "exception " + ex.GetType().Name, CurrentEvidence(true), true);
++            throw;
++        }
++
++        if (Enabled)
++        {
++            string action = outcome.IoctlSucceeded ? "completed" : "failed";
++            Emit(action, caller, "DEVS", deviceId, requested,
++                $"devs={outcome.Result} ioctl={(outcome.IoctlSucceeded ? "ok" : "fail")} bytes={outcome.BytesReturned} win32={outcome.Win32Error}",
++                CurrentEvidence(true), true);
++        }
++        return outcome.Result;
++    }
++
++    public bool TryMutate(string caller, string api, string requested, XgOp op, Action mutate)
++    {
++        if (!Enabled)
++        {
++            mutate();
++            return true;
++        }
++
++        using var lease = Enter(caller, api, op);
++        if (!lease.Allowed) return false;
++        try
++        {
++            mutate();
++        }
++        catch (Exception ex)
++        {
++            Emit("failed", caller, api, null, requested, "exception " + ex.GetType().Name, lease.Evidence, false);
++            throw;
++        }
++        Emit("completed", caller, api, null, requested, "sent", lease.Evidence, false);
++        return true;
++    }
++
++    public void RunCpuBoost(string caller, Action writeWindowsSetting)
++    {
++        try
++        {
++            writeWindowsSetting();
++        }
++        catch (Exception ex)
++        {
++            if (Enabled)
++            {
++                XgDockSnapshot evidence;
++                lock (gate) evidence = last;
++                Emit("failed", caller, "PowerWriteACValueIndex", null, "windows-boost", ex.GetType().Name, evidence, true);
++            }
++            throw;
++        }
++
++        if (Enabled)
++        {
++            XgDockSnapshot evidence;
++            lock (gate) evidence = last;
++            Emit("completed", caller, "PowerWriteACValueIndex", null, "windows-boost", "sent", evidence, true);
++        }
++    }
++
++    public void LogCompleted(Lease lease, string caller, string api, string requested, string result)
++    {
++        if (!Enabled || !lease.Allowed || !lease.OwnsAdmission) return;
++        Emit("completed", caller, api, null, requested, result, lease.Evidence, false);
++    }
++
++    public void LogFailed(Lease lease, string caller, string api, string requested, string result)
++    {
++        if (!Enabled || !lease.Allowed || !lease.OwnsAdmission) return;
++        Emit("failed", caller, api, null, requested, result, lease.Evidence, false);
++    }
++
++    XgDockSnapshot ReadFresh()
++    {
++        try
++        {
++            if (ReadState == null) return UnknownSnapshot("reader_missing");
++            return ReadState();
++        }
++        catch
++        {
++            return UnknownSnapshot("reader_exception");
++        }
++    }
++
++    XgDockSnapshot CurrentEvidence(bool cached)
++    {
++        lock (gate)
++        {
++            if (transition > 0) return TransitionSnapshot();
++            var snap = last;
++            if (cached && snap.Source == "fresh_dsts")
++                return snap with { Source = "cached_dsts" };
++            return snap;
++        }
++    }
++
++    XgDockSnapshot TransitionSnapshot() => new()
++    {
++        State = XgDockState.Transitioning,
++        Utc = UtcNow(),
++        MonoMs = MonotonicMs(),
++        HasSample = true,
++        Source = "transition_flag"
++    };
++
++    XgDockSnapshot UnknownSnapshot(string source) => new()
++    {
++        State = XgDockState.Unknown,
++        Utc = UtcNow(),
++        MonoMs = MonotonicMs(),
++        HasSample = false,
++        Source = source
++    };
++
++    void Emit(string action, string caller, string api, uint? device, string requested, string result, XgDockSnapshot dock, bool cached)
++    {
++        long now = MonotonicMs();
++        long age = dock.HasSample ? now - dock.MonoMs : -1;
++        string id = device.HasValue ? "0x" + device.Value.ToString("X8") : "-";
++        Write(
++            $"XG utc={UtcNow():O} mono_ms={now} action={action} caller={caller} api={api} device={id} value={requested} result={result} " +
++            $"dock_state={dock.State} dock_source={dock.Source} dock_cached={(cached ? "yes" : "no")} dock_age_ms={age} dock_utc={dock.Utc:O} " +
++            $"connected=[{dock.Connected}] activation=[{dock.Activation}]");
++    }
++
++    public readonly struct Lease : IDisposable
++    {
++        readonly XgMitigation? owner;
++        readonly bool owned;
++        public bool Allowed { get; }
++        public bool Enforced { get; }
++        public bool OwnsAdmission { get; }
++        public XgDockSnapshot Evidence { get; }
++
++        Lease(XgMitigation? owner, bool owned, bool allowed, bool enforced, XgDockSnapshot evidence)
++        {
++            this.owner = owner;
++            this.owned = owned;
++            Allowed = allowed;
++            Enforced = enforced;
++            OwnsAdmission = owned;
++            Evidence = evidence;
++        }
++
++        public static Lease Bypass() => new(null, false, true, false, default);
++        public static Lease Owned(XgMitigation owner, XgDockSnapshot evidence) => new(owner, true, true, true, evidence);
++        public static Lease Nested(XgDockSnapshot evidence) => new(null, false, true, true, evidence);
++        public static Lease Deny(XgDockSnapshot evidence) => new(null, false, false, true, evidence);
++
++        public void Dispose()
++        {
++            if (owned && owner != null) owner.End();
++        }
++    }
++
++    public readonly struct ExplicitScope : IDisposable
++    {
++        readonly XgOp previous;
++        readonly bool armed;
++
++        internal ExplicitScope(XgOp previous)
++        {
++            this.previous = previous;
++            armed = true;
++        }
++
++        public void Dispose()
++        {
++            if (armed) explicitOps.Value = previous;
++        }
++    }
++}
++
++public enum TempOrigin
++{
++    FreshAsus,
++    Cached,
++    ThermalZone,
++    Failed
++}
++
++public readonly struct TempSample
++{
++    public DateTimeOffset Utc { get; init; }
++    public long MonoMs { get; init; }
++    public TempOrigin Origin { get; init; }
++    public bool TransportAttempted { get; init; }
++    public bool TransportOk { get; init; }
++    public uint BytesReturned { get; init; }
++    public int Win32Error { get; init; }
++    public string RawHex { get; init; }
++    public int? Decoded { get; init; }
++    public float? Reported { get; init; }
++}
++
++public sealed class XgTempTrace
++{
++    public static readonly XgTempTrace Shared = new();
++    readonly TempSample[] ring = new TempSample[16];
++    int next;
++    int count;
++    long lastPeriodicMs = long.MinValue;
++    bool episode;
++    TempOrigin lastOrigin = (TempOrigin)(-1);
++
++    public Action<string> Write { get; set; } = Logger.WriteLine;
++    public Func<DateTimeOffset> UtcNow { get; set; } = () => DateTimeOffset.UtcNow;
++    public Func<long> MonotonicMs { get; set; } = () => Environment.TickCount64;
++
++    public void RecordCached(float? reported)
++    {
++        Push(new TempSample
++        {
++            Utc = UtcNow(),
++            MonoMs = MonotonicMs(),
++            Origin = TempOrigin.Cached,
++            TransportAttempted = false,
++            Reported = reported,
++            RawHex = "-"
++        });
++    }
++
++    public void Record(DecodedRead read, TempOrigin origin, float? reported)
++    {
++        string raw = read.Buffer != null && read.Buffer.Length >= 4
++            ? BitConverter.ToString(read.Buffer, 0, 4)
++            : "-";
++        var sample = new TempSample
++        {
++            Utc = UtcNow(),
++            MonoMs = MonotonicMs(),
++            Origin = origin,
++            TransportAttempted = true,
++            TransportOk = read.IoctlSucceeded && read.BytesReturned >= 4,
++            BytesReturned = read.BytesReturned,
++            Win32Error = read.Win32Error,
++            RawHex = raw,
++            Decoded = read.Buffer != null && read.Buffer.Length >= 4 ? read.Decoded : null,
++            Reported = reported
++        };
++        var prior = Snapshot();
++        Push(sample);
++        Flush(sample, prior);
++    }
++
++    public TempSample[] Snapshot()
++    {
++        lock (ring)
++        {
++            var list = new TempSample[count];
++            int start = (next - count + ring.Length) % ring.Length;
++            for (int i = 0; i < count; i++)
++                list[i] = ring[(start + i) % ring.Length];
++            return list;
++        }
++    }
++
++    void Push(TempSample sample)
++    {
++        lock (ring)
++        {
++            ring[next] = sample;
++            next = (next + 1) % ring.Length;
++            if (count < ring.Length) count++;
++        }
++    }
++
++    void Flush(TempSample sample, TempSample[] prior)
++    {
++        bool hot = sample.Reported >= 100;
++        bool failed = sample.Origin == TempOrigin.Failed;
++        bool interesting = hot || failed;
++        bool sourceChanged = sample.Origin != lastOrigin;
++        long now = sample.MonoMs;
++
++        if (interesting)
++        {
++            if (!episode)
++            {
++                foreach (var old in prior)
++                    Write(Format(old, "history"));
++                episode = true;
++            }
++            Write(Format(sample, "sample"));
++        }
++        else if (sourceChanged || now - lastPeriodicMs >= 60000)
++        {
++            episode = false;
++            lastPeriodicMs = now;
++            Write(Format(sample, "sample"));
++        }
++        else
++        {
++            episode = false;
++        }
++        lastOrigin = sample.Origin;
++    }
++
++    static string Format(TempSample sample, string kind)
++    {
++        string transport = sample.TransportAttempted
++            ? (sample.TransportOk ? "ok" : "fail")
++            : "not_read";
++        string decoded = sample.Decoded.HasValue ? sample.Decoded.Value.ToString() : "-";
++        string reported = sample.Reported.HasValue ? sample.Reported.Value.ToString("0.##") : "-";
++        return $"TEMP kind={kind} utc={sample.Utc:O} mono_ms={sample.MonoMs} origin={sample.Origin} transport={transport} bytes={sample.BytesReturned} win32={sample.Win32Error} raw={sample.RawHex} decoded={decoded} reported={reported}";
++    }
++}
+diff --git a/app/Pawn/RyzenSmu.cs b/app/Pawn/RyzenSmu.cs
+index b063297..ad97bb7 100644
+--- a/app/Pawn/RyzenSmu.cs
++++ b/app/Pawn/RyzenSmu.cs
+@@ -147,20 +147,42 @@ namespace PawnIO
+         public bool CanSetThm()   => _cpu is not CpuCodeName.Undefined;
+ 
+         public bool SetAllLimits(int stapmW, int fastW, int slowW)
+-            => SetStapm(stapmW) == SmuStatus.OK & SetFast(fastW) == SmuStatus.OK & SetSlow(slowW) == SmuStatus.OK;
++        {
++            SetAllLimits(stapmW, fastW, slowW, out SmuStatus stapm, out SmuStatus fast, out SmuStatus slow);
++            return stapm == SmuStatus.OK & fast == SmuStatus.OK & slow == SmuStatus.OK;
++        }
+ 
+         public void SetAllLimits(int stapmW, int fastW, int slowW,
+             out SmuStatus stapm, out SmuStatus fast, out SmuStatus slow)
+         {
+-            stapm = SetStapm(stapmW);
+-            fast  = SetFast(fastW);
+-            slow  = SetSlow(slowW);
++            stapm = SmuStatus.Failed;
++            fast = SmuStatus.Failed;
++            slow = SmuStatus.Failed;
++            using var lease = XgMitigation.Shared.Enter("SetAllLimits", "SMU", XgOp.Power);
++            if (!lease.Allowed) return;
++            try
++            {
++                stapm = SetStapm(stapmW);
++                fast = SetFast(fastW);
++                slow = SetSlow(slowW);
++            }
++            catch (Exception ex)
++            {
++                XgMitigation.Shared.LogFailed(lease, "SetAllLimits", "SMU", $"{stapmW}/{fastW}/{slowW}", ex.GetType().Name);
++                throw;
++            }
++            XgMitigation.Shared.LogCompleted(lease, "SetAllLimits", "SMU", $"{stapmW}/{fastW}/{slowW}", $"{stapm}/{fast}/{slow}");
+         }
+ 
+         public SmuStatus SetCoAll(int value)
+         {
++            using var lease = XgMitigation.Shared.Enter("SetCoAll", "SMU", XgOp.Uv);
++            if (!lease.Allowed) return SmuStatus.Failed;
+             uint v = EncodeCurve(value);
+-            return Family switch
++            SmuStatus status;
++            try
++            {
++                status = Family switch
+             {
+                 // RyzenAdj: _do_adjust(0x55) — MP1 only
+                 CpuFamily.Renoir                         => SendMp1(0x55, v),
+@@ -172,27 +194,53 @@ namespace PawnIO
+                 CpuFamily.Raphael                        => SendPsmu(0x07, v),
+                 _                                        => SmuStatus.Failed,
+             };
++            }
++            catch (Exception ex)
++            {
++                XgMitigation.Shared.LogFailed(lease, "SetCoAll", "SMU", value.ToString(), ex.GetType().Name);
++                throw;
++            }
++            XgMitigation.Shared.LogCompleted(lease, "SetCoAll", "SMU", value.ToString(), status.ToString());
++            return status;
+         }
+ 
+         public SmuStatus SetCoPer(int core, int value)
+         {
++            using var lease = XgMitigation.Shared.Enter("SetCoPer", "SMU", XgOp.Uv);
++            if (!lease.Allowed) return SmuStatus.Failed;
+             // UXTU: ((ccd << 8 | core) << 20) | (offset & 0xFFFF); ccd bits only on DragonRange
+             uint sel = Family == CpuFamily.Raphael ? (uint)(core / 8 << 8 | core % 8) : (uint)core;
+             uint v = sel << 20 | ((uint)value & 0xFFFF);
+-            return Family switch
++            SmuStatus status;
++            try
+             {
+-                CpuFamily.Renoir                         => SendMp1(0x54, v),
+-                CpuFamily.Mobile or CpuFamily.StrixPoint
+-                or CpuFamily.StrixHalo                   => SendMp1(0x4B, v),
+-                CpuFamily.Raphael                        => SendPsmu(0x06, v),
+-                _                                        => SmuStatus.Failed,
+-            };
++                status = Family switch
++                {
++                    CpuFamily.Renoir                         => SendMp1(0x54, v),
++                    CpuFamily.Mobile or CpuFamily.StrixPoint
++                    or CpuFamily.StrixHalo                   => SendMp1(0x4B, v),
++                    CpuFamily.Raphael                        => SendPsmu(0x06, v),
++                    _                                        => SmuStatus.Failed,
++                };
++            }
++            catch (Exception ex)
++            {
++                XgMitigation.Shared.LogFailed(lease, "SetCoPer", "SMU", core + ":" + value, ex.GetType().Name);
++                throw;
++            }
++            XgMitigation.Shared.LogCompleted(lease, "SetCoPer", "SMU", core + ":" + value, status.ToString());
++            return status;
+         }
+ 
+         public SmuStatus SetCoGfx(int value)
+         {
++            using var lease = XgMitigation.Shared.Enter("SetCoGfx", "SMU", XgOp.Uv);
++            if (!lease.Allowed) return SmuStatus.Failed;
+             uint v = EncodeCurve(value);
+-            return Family switch
++            SmuStatus status;
++            try
++            {
++                status = Family switch
+             {
+                 // RyzenAdj: _do_adjust(0x64) — MP1 only
+                 CpuFamily.Renoir                                 => SendMp1(0x64, v),
+@@ -202,12 +250,25 @@ namespace PawnIO
+                 // StrixPoint/KrackanPoint: no set-cogfx in UXTU or RyzenAdj
+                 _                                                => SmuStatus.Failed,
+             };
++            }
++            catch (Exception ex)
++            {
++                XgMitigation.Shared.LogFailed(lease, "SetCoGfx", "SMU", value.ToString(), ex.GetType().Name);
++                throw;
++            }
++            XgMitigation.Shared.LogCompleted(lease, "SetCoGfx", "SMU", value.ToString(), status.ToString());
++            return status;
+         }
+ 
+         public SmuStatus SetThm(int celsius)
+         {
++            using var lease = XgMitigation.Shared.Enter("SetThm", "SMU", XgOp.Thermal);
++            if (!lease.Allowed) return SmuStatus.Failed;
+             uint v = (uint)celsius;
+-            return Family switch
++            SmuStatus status;
++            try
++            {
++                status = Family switch
+             {
+                 // RyzenAdj: _do_adjust(0x1F) — MP1 only
+                 CpuFamily.Raven                          => SendMp1(0x1F, v),
+@@ -220,6 +281,14 @@ namespace PawnIO
+                 CpuFamily.Raphael                        => SendMp1(0x3F, v),
+                 _                                        => SmuStatus.Failed,
+             };
++            }
++            catch (Exception ex)
++            {
++                XgMitigation.Shared.LogFailed(lease, "SetThm", "SMU", celsius.ToString(), ex.GetType().Name);
++                throw;
++            }
++            XgMitigation.Shared.LogCompleted(lease, "SetThm", "SMU", celsius.ToString(), status.ToString());
++            return status;
+         }
+ 
+         public bool GetCodeName(out CpuCodeName codeName)
+diff --git a/app/Program.cs b/app/Program.cs
+index d6a397d..5e45c78 100644
+--- a/app/Program.cs
++++ b/app/Program.cs
+@@ -77,6 +77,7 @@ namespace GHelper
+ 
+             Logger.WriteLine("----------------------");
+             Logger.WriteLine("App launched: " + AppConfig.GetModel() + " :" + Assembly.GetExecutingAssembly().GetName().Version.ToString() + CultureInfo.CurrentUICulture + (ProcessHelper.IsUserAdministrator() ? "." : ""));
++            Logger.WriteLine("XG diagnostic build: " + Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion);
+ 
+             settingsForm = new SettingsForm();
+             modeControl = new ModeControl();
+diff --git a/app/Settings.cs b/app/Settings.cs
+index b95cb7d..1144e86 100644
+--- a/app/Settings.cs
++++ b/app/Settings.cs
+@@ -364,7 +364,8 @@ namespace GHelper
+ 
+         private void ButtonAutoTDP_Click(object? sender, EventArgs e)
+         {
+-            allyControl.ToggleAutoTDP();
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                allyControl.ToggleAutoTDP();
+         }
+ 
+         private void LabelCharge_Click(object? sender, EventArgs e)
+@@ -861,7 +862,11 @@ namespace GHelper
+             {
+                 var menuMode = new ToolStripMenuItem(mode.Value);
+                 menuMode.Tag = mode.Key;
+-                menuMode.Click += (sender, args) => { Program.modeControl.SetPerformanceMode(mode.Key); };
++                menuMode.Click += (sender, args) =>
++                {
++                    using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                        Program.modeControl.SetPerformanceMode(mode.Key);
++                };
+                 menuMode.Margin = padding;
+                 menuMode.Checked = (mode.Key == currentMode);
+                 contextMenuStrip.Items.Add(menuMode);
+@@ -1778,13 +1783,26 @@ namespace GHelper
+                     break;
+             }
+ 
++            bool xgmLocked = Program.acpi.IsXGActive();
++            ButtonEnabled(buttonSilent, !xgmLocked);
++            ButtonEnabled(buttonBalanced, !xgmLocked);
++            ButtonEnabled(buttonTurbo, !xgmLocked);
++            if (xgmLocked)
++                labelPerf.Text = "Performance Mode locked while XG Mobile is on";
++            else if (labelPerf.Text.Contains("locked while XG Mobile"))
++                labelPerf.Text = Properties.Strings.PerformanceMode;
++
+             foreach (var item in contextMenuStrip.Items)
+             {
+                 if (item is ToolStripMenuItem menuItem && menuItem.Tag is not null)
+                 {
+                     menuItem.Checked = ((int)menuItem.Tag == mode);
++                    menuItem.Enabled = !xgmLocked;
+                 }
+             }
++
++            if (fansForm != null && !fansForm.IsDisposed && fansForm.Text != "")
++                fansForm.ApplyXgLock();
+         }
+ 
+ 
+@@ -1819,6 +1837,7 @@ namespace GHelper
+         void VisualizeXGM(bool connected, int activated, int GPUMode)
+         {
+             buttonXGM.Enabled = buttonXGM.Visible = connected;
++            ShowMode(Modes.GetCurrent());
+ 
+             if (!connected) return;
+ 
+@@ -2025,17 +2044,20 @@ namespace GHelper
+ 
+         private void ButtonSilent_Click(object? sender, EventArgs e)
+         {
+-            Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceSilent);
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceSilent);
+         }
+ 
+         private void ButtonBalanced_Click(object? sender, EventArgs e)
+         {
+-            Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceBalanced);
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceBalanced);
+         }
+ 
+         private void ButtonTurbo_Click(object? sender, EventArgs e)
+         {
+-            Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceTurbo);
++            using (XgMitigation.Explicit(XgMitigation.ProfileApply))
++                Program.modeControl.SetPerformanceMode(AsusACPI.PerformanceTurbo);
+         }
+ 
+ 
+diff --git a/tests/GHelper.XgTests/GHelper.XgTests.csproj b/tests/GHelper.XgTests/GHelper.XgTests.csproj
+new file mode 100644
+index 0000000..749b28e
+--- /dev/null
++++ b/tests/GHelper.XgTests/GHelper.XgTests.csproj
+@@ -0,0 +1,23 @@
++<Project Sdk="Microsoft.NET.Sdk">
++
++  <PropertyGroup>
++    <TargetFramework>net10.0-windows</TargetFramework>
++    <Nullable>annotations</Nullable>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <IsPackable>false</IsPackable>
++    <Platforms>x64</Platforms>
++    <Platform>x64</Platform>
++    <PlatformTarget>x64</PlatformTarget>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
++    <PackageReference Include="xunit" Version="2.9.3" />
++    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
++  </ItemGroup>
++
++  <ItemGroup>
++    <ProjectReference Include="..\..\app\GHelper.csproj" />
++  </ItemGroup>
++
++</Project>
+diff --git a/tests/GHelper.XgTests/GpuControlPresentationTests.cs b/tests/GHelper.XgTests/GpuControlPresentationTests.cs
+new file mode 100644
+index 0000000..a013a99
+--- /dev/null
++++ b/tests/GHelper.XgTests/GpuControlPresentationTests.cs
+@@ -0,0 +1,318 @@
++using GHelper.Mode;
++using Xunit;
++
++public class GpuControlPresentationTests
++{
++    static DecodedRead Value(int decoded, bool ok = true, uint bytes = 16)
++    {
++        var buffer = new byte[Math.Max(4, bytes)];
++        BitConverter.GetBytes(decoded + 65536).CopyTo(buffer, 0);
++        return new DecodedRead
++        {
++            IoctlSucceeded = ok,
++            BytesReturned = bytes,
++            Win32Error = ok ? 0 : 6,
++            Buffer = buffer
++        };
++    }
++
++    static DecodedRead TransportFailed() => new()
++    {
++        IoctlSucceeded = false,
++        BytesReturned = 16,
++        Win32Error = 6,
++        Buffer = new byte[16]
++    };
++
++    static DecodedRead Short() => new()
++    {
++        IoctlSucceeded = true,
++        BytesReturned = 2,
++        Buffer = new byte[2]
++    };
++
++    static XgDockSnapshot Reads(DecodedRead connected, DecodedRead activation)
++        => XgDockClassifier.FromReads(connected, activation);
++
++    static XgDockSnapshot ConnectedInactive() => Reads(Value(1), Value(0));
++    static XgDockSnapshot Disconnected() => Reads(Value(0), Value(0));
++    static XgDockSnapshot Active() => Reads(Value(1), Value(1));
++    static XgDockSnapshot Failed() => Reads(TransportFailed(), TransportFailed());
++    static XgDockSnapshot ShortRead() => Reads(Short(), Short());
++    static XgDockSnapshot UnknownValue() => Reads(Value(1), Value(0x101));
++
++    static XgDockSnapshot Transitioning() => new()
++    {
++        State = XgDockState.Transitioning,
++        Connected = Value(1),
++        Activation = Value(1),
++        HasSample = true,
++        Source = "transition_flag"
++    };
++
++    static GpuPowerCapability.Result Probe(DecodedRead gpuBase, DecodedRead? gpuPower = null, int? measured = null, int? fallback = null)
++        => GpuPowerCapability.Evaluate(gpuBase, gpuPower ?? default, measured, fallback);
++
++    static GpuControlPresentation.Decision Present(
++        XgDockSnapshot snap,
++        DecodedRead gpuBase,
++        DecodedRead? gpuPower = null,
++        int? measured = null,
++        bool nvidia = false,
++        bool boost = false,
++        bool temp = false,
++        bool clocks = false,
++        bool admissionClosed = false,
++        bool eco = false,
++        string? initFault = null,
++        int? fallback = 175)
++        => GpuControlPresentation.Decide(
++            snap, admissionClosed, true, nvidia,
++            Probe(gpuBase, gpuPower, measured, fallback),
++            boost, temp, clocks, eco, initFault, "test-build");
++
++    static GpuControlPresentation.BoundControls Wire(GpuControlPresentation.Decision decision, string wattLabel = "105W")
++        => GpuControlPresentation.Bind(decision, wattLabel);
++
++    [Fact]
++    public void MeasuredRange_IsTheOnlyEstablishedRange()
++    {
++        var valid = Probe(Value(100), Value(20), 150);
++        Assert.True(valid.RangeEstablished);
++        Assert.Equal(150 - 100 - AsusACPI.MaxGPUBoost, valid.AdditionalMaximum);
++        Assert.Equal("nvidia-smi", valid.RangeSource);
++        Assert.Equal("nvidia-smi", Probe(Value(100), Value(20), 150, 175).RangeSource);
++
++        var fallback = Probe(Value(100), Value(20), null, 175);
++        Assert.True(fallback.RangeEstablished);
++        Assert.Equal("model-fallback", fallback.RangeSource);
++        Assert.Equal(175 - 100 - AsusACPI.MaxGPUBoost, fallback.AdditionalMaximum);
++        var missing = Probe(Value(100), Value(20), null, null);
++        Assert.True(missing.BasePositive);
++        Assert.True(missing.PowerResponds);
++        Assert.False(missing.RangeEstablished);
++        Assert.Null(missing.AdditionalMaximum);
++        Assert.False(Probe(Value(0), Value(20), 150).BasePositive);
++        Assert.False(Probe(Value(-1), Value(20), 150).BasePositive);
++        Assert.False(Probe(TransportFailed(), Value(20), 150).BasePositive);
++        Assert.False(Probe(Short(), Value(20), 150).BasePositive);
++        Assert.False(Probe(Value(100), TransportFailed(), 150).PowerResponds);
++    }
++
++    [Theory]
++    [InlineData(0)]
++    [InlineData(-1)]
++    public void ConnectedInactive_KeepsThePowerRowWhenGpuBaseIsNotPositive(int decoded)
++    {
++        var decision = Present(ConnectedInactive(), Value(decoded), Value(20), 150, boost: true, temp: true);
++        var bound = Wire(decision);
++        Assert.True(decision.PageVisible);
++        Assert.True(decision.CpuTdpEnabled);
++        Assert.True(bound.PowerRowVisible);
++        Assert.False(bound.PowerEnabled);
++        Assert.False(decision.ShowWattValue);
++        Assert.Equal(GpuControlPresentation.WattUnavailableLabel, bound.PowerLabel);
++        Assert.Equal(GpuControlPresentation.CapabilityUnavailableText, bound.Notice);
++        Assert.Equal("gpu_base_unavailable", decision.Reason);
++        Assert.True(bound.ApplyLimitsEnabled);
++        Assert.Contains("slider=visible/disabled", decision.Diagnostic);
++        Assert.Contains("decoded=" + decoded, decision.Diagnostic);
++        Assert.Contains("build=test-build", decision.Diagnostic);
++        Assert.Contains("dock=Inactive", decision.Diagnostic);
++        Assert.DoesNotContain("175", bound.PowerLabel);
++    }
++
++    [Theory]
++    [InlineData("failed")]
++    [InlineData("short")]
++    public void ConnectedInactive_KeepsThePowerRowWhenGpuBaseTransportFails(string kind)
++    {
++        DecodedRead gpuBase = kind == "failed" ? TransportFailed() : Short();
++        var first = Present(ConnectedInactive(), gpuBase);
++        var refresh = Present(ConnectedInactive(), gpuBase);
++        var bound = Wire(refresh);
++        Assert.True(first.GpuPowerVisible);
++        Assert.True(bound.PowerRowVisible);
++        Assert.False(bound.PowerEnabled);
++        Assert.Equal(GpuControlPresentation.WattUnavailableLabel, bound.PowerLabel);
++        Assert.Equal("gpu_base_unavailable", refresh.Reason);
++        Assert.Contains(kind == "failed" ? "ioctl=fail" : "bytes=2", refresh.Diagnostic);
++        Assert.Contains("powerResponds=0", refresh.Diagnostic);
++    }
++
++    [Fact]
++    public void ConnectedInactive_WithoutNvidia_EnablesOnlyAMeasuredRange()
++    {
++        var decision = Present(ConnectedInactive(), Value(100), Value(20), 150, boost: true, temp: true);
++        var bound = Wire(decision, "120W");
++        Assert.False(decision.ClockOffsetVisible);
++        Assert.False(decision.ClockLimitVisible);
++        Assert.True(bound.PowerRowVisible);
++        Assert.True(bound.PowerEnabled);
++        Assert.True(decision.CpuTdpEnabled);
++        Assert.Equal("120W", bound.PowerLabel);
++        Assert.Equal("editable", decision.Reason);
++        Assert.True(bound.ApplyLimitsEnabled);
++        Assert.False(bound.NoticeVisible);
++        Assert.Contains("slider=visible/enabled", decision.Diagnostic);
++        Assert.Contains("range=nvidia-smi max=150 additional=" + (150 - 100 - AsusACPI.MaxGPUBoost), decision.Diagnostic);
++        Assert.Contains("powerResponds=1", decision.Diagnostic);
++        Assert.Contains("ioctl=ok", decision.Diagnostic);
++    }
++
++    [Fact]
++    public void MissingMeasurement_UsesTheModelFallbackAndShowsWatts()
++    {
++        var decision = Present(ConnectedInactive(), Value(100), Value(20), null);
++        var bound = Wire(decision, "150W");
++        Assert.True(bound.PowerRowVisible);
++        Assert.True(bound.PowerEnabled);
++        Assert.False(bound.NoticeVisible);
++        Assert.Equal("150W", bound.PowerLabel);
++        Assert.Equal("editable", decision.Reason);
++        Assert.Contains("range=model-fallback max=175 additional=" + (175 - 100 - AsusACPI.MaxGPUBoost), decision.Diagnostic);
++        Assert.Contains("measured=none", decision.Diagnostic);
++
++        var noFallback = Present(ConnectedInactive(), Value(100), Value(20), null, fallback: null);
++        Assert.False(noFallback.ShowWattValue);
++        Assert.Equal(GpuControlPresentation.WattUnavailableLabel, Wire(noFallback, "175W").PowerLabel);
++        Assert.Equal("range_unavailable", noFallback.Reason);
++    }
++
++    [Fact]
++    public void GpuPowerReadFailure_StillShowsTheUpstreamRange()
++    {
++        var decision = Present(ConnectedInactive(), Value(100), TransportFailed(), null);
++        var bound = Wire(decision, "150W");
++        Assert.True(bound.PowerRowVisible);
++        Assert.True(bound.PowerEnabled);
++        Assert.Equal("150W", bound.PowerLabel);
++        Assert.Equal("editable", decision.Reason);
++        Assert.Contains("powerResponds=0", decision.Diagnostic);
++    }
++
++    [Fact]
++    public void ActiveAndTransitioning_LockTheVisibleRow()
++    {
++        foreach (var snap in new[] { Active(), Transitioning() })
++        {
++            var valid = Present(snap, Value(100), Value(20), 150, nvidia: false);
++            var failedBase = Present(snap, Value(0));
++            Assert.True(Wire(valid, "120W").PowerRowVisible);
++            Assert.False(Wire(valid).PowerEnabled);
++            Assert.Equal(XgMitigation.GpuLimitsLockedText, valid.Notice);
++            Assert.Equal("locked", valid.Reason);
++            Assert.Equal("120W", Wire(valid, "120W").PowerLabel);
++            Assert.True(Wire(failedBase).PowerRowVisible);
++            Assert.False(Wire(failedBase).PowerEnabled);
++            Assert.Equal(GpuControlPresentation.WattUnavailableLabel, Wire(failedBase, "105W").PowerLabel);
++            Assert.False(Wire(valid).ApplyLimitsEnabled);
++            Assert.False(Wire(failedBase).ApplyLimitsEnabled);
++            Assert.Equal("locked", failedBase.Reason);
++            Assert.Contains("dock=" + snap.State, failedBase.Diagnostic);
++        }
++    }
++
++    [Fact]
++    public void InitFault_DoesNotHideAConnectedPowerRow()
++    {
++        var decision = Present(ConnectedInactive(), Value(0), initFault: "InvalidOperationException");
++        var bound = Wire(decision);
++        Assert.True(bound.PageVisible);
++        Assert.True(bound.PowerRowVisible);
++        Assert.False(bound.PowerEnabled);
++        Assert.Contains("init=InvalidOperationException", decision.Diagnostic);
++        Assert.Equal("gpu_base_unavailable", decision.Reason);
++    }
++
++    [Fact]
++    public void Refresh_KeepsTheConnectedPowerRowVisible()
++    {
++        var open = Wire(Present(ConnectedInactive(), Value(0)));
++        var afterInit = Wire(Present(ConnectedInactive(), TransportFailed()));
++        var afterLockRefresh = Wire(Present(Active(), Value(0)));
++        Assert.True(open.PowerRowVisible);
++        Assert.True(afterInit.PowerRowVisible);
++        Assert.True(afterLockRefresh.PowerRowVisible);
++        Assert.False(afterLockRefresh.PowerEnabled);
++    }
++
++    [Fact]
++    public void EcoOnAConnectedDock_DoesNotHideThePageOrPowerRow()
++    {
++        var connected = Present(ConnectedInactive(), Value(0), eco: true);
++        Assert.True(connected.PageVisible);
++        Assert.True(Wire(connected).PowerRowVisible);
++        var disconnected = Present(Disconnected(), Value(100), Value(20), 150, nvidia: true, eco: true);
++        Assert.False(disconnected.PageVisible);
++        Assert.False(Wire(disconnected).PowerRowVisible);
++        Assert.Equal("page_hidden", disconnected.Reason);
++    }
++
++    [Fact]
++    public void Disconnected_HidesTheGpuPage_AndLeavesCpuTdpAvailable()
++    {
++        var shown = Present(Disconnected(), Value(100), Value(20), 150);
++        Assert.False(shown.PageVisible);
++        Assert.True(shown.CpuTdpEnabled);
++        Assert.False(Wire(shown).PowerRowVisible);
++        Assert.Null(shown.Notice);
++    }
++
++    [Theory]
++    [InlineData("transition")]
++    [InlineData("unknown")]
++    [InlineData("failed")]
++    [InlineData("short")]
++    [InlineData("pending")]
++    public void ClosedStates_BlockTheSlider(string state)
++    {
++        XgDockSnapshot snap = state switch
++        {
++            "transition" => Transitioning(),
++            "unknown" => UnknownValue(),
++            "failed" => Failed(),
++            "short" => ShortRead(),
++            "pending" => ConnectedInactive(),
++            _ => throw new ArgumentOutOfRangeException(nameof(state))
++        };
++        bool connected = state is "transition" or "unknown" or "pending";
++        var shown = Present(snap, Value(0), boost: true, temp: true, admissionClosed: state is "transition" or "pending");
++        var bound = Wire(shown);
++        Assert.Equal(connected, shown.PageVisible);
++        Assert.Equal(connected, bound.PowerRowVisible);
++        Assert.False(shown.CpuTdpEnabled);
++        Assert.False(bound.PowerEnabled);
++        Assert.False(bound.BoostEnabled);
++        Assert.False(bound.TempEnabled);
++        if (shown.PageVisible)
++            Assert.Equal(XgMitigation.GpuLimitsLockedText, shown.Notice);
++    }
++
++    [Fact]
++    public void VisibilityDecision_DoesNotItselfWrite()
++    {
++        var writes = 0;
++        var shown = Present(ConnectedInactive(), Value(100), Value(20), 150);
++        Assert.True(shown.GpuPowerEnabled);
++        Assert.Equal(0, writes);
++    }
++
++    [Fact]
++    public void UnrequestedGpuPower_IsNotWritten()
++    {
++        var script = new Queue<XgDockSnapshot>();
++        script.Enqueue(ConnectedInactive());
++        var guard = new XgMitigation { Write = _ => { } };
++        guard.Enable(() => script.Dequeue());
++        var writes = new List<uint>();
++        var result = guard.ApplySupportedGpuLimits(false, 10, true, 5, false, 80, (device, _, _) =>
++        {
++            writes.Add(device);
++            return 1;
++        });
++        Assert.False(result.Suppressed);
++        Assert.DoesNotContain(AsusACPI.GPU_POWER, writes);
++        Assert.Contains((uint)AsusACPI.PPT_GPUC0, writes);
++    }
++}
+diff --git a/tests/GHelper.XgTests/GpuLimitTests.cs b/tests/GHelper.XgTests/GpuLimitTests.cs
+new file mode 100644
+index 0000000..26f48d1
+--- /dev/null
++++ b/tests/GHelper.XgTests/GpuLimitTests.cs
+@@ -0,0 +1,210 @@
++using Xunit;
++
++public class GpuLimitTests
++{
++    sealed class Script
++    {
++        public Queue<XgDockSnapshot> Next { get; } = new();
++        public XgDockSnapshot Read() => Next.Dequeue();
++    }
++
++    static DecodedRead Value(int decoded, bool ok = true, uint bytes = 16)
++    {
++        var buffer = new byte[Math.Max(4, bytes)];
++        BitConverter.GetBytes(decoded + 65536).CopyTo(buffer, 0);
++        return new DecodedRead
++        {
++            IoctlSucceeded = ok,
++            BytesReturned = bytes,
++            Win32Error = ok ? 0 : 6,
++            Buffer = buffer
++        };
++    }
++
++    static DecodedRead TransportFailed() => new()
++    {
++        IoctlSucceeded = false,
++        BytesReturned = 16,
++        Win32Error = 6,
++        Buffer = new byte[16]
++    };
++
++    static DecodedRead Short() => new()
++    {
++        IoctlSucceeded = true,
++        BytesReturned = 2,
++        Buffer = new byte[2]
++    };
++
++    static XgDockSnapshot Reads(DecodedRead connected, DecodedRead activation)
++        => XgDockClassifier.FromReads(connected, activation);
++
++    static XgDockSnapshot Active() => Reads(Value(1), Value(1));
++    static XgDockSnapshot Inactive() => Reads(Value(1), Value(0));
++    static XgDockSnapshot Failed() => Reads(TransportFailed(), TransportFailed());
++    static XgDockSnapshot ShortRead() => Reads(Short(), Short());
++    static XgDockSnapshot UnknownValue() => Reads(Value(1), Value(0x101));
++
++    static (XgMitigation Guard, Script Script) NewGuard(params XgDockSnapshot[] queued)
++    {
++        var script = new Script();
++        foreach (var item in queued) script.Next.Enqueue(item);
++        var guard = new XgMitigation { Write = _ => { } };
++        guard.Enable(script.Read);
++        return (guard, script);
++    }
++
++    static XgMitigation.GpuLimitApplyResult Apply(XgMitigation guard, List<(uint Device, int Value)> writes, bool explicitApply = false, int boostResult = 1)
++    {
++        XgMitigation.GpuLimitApplyResult result;
++        Func<uint, int, string, int> write = (device, value, _) =>
++        {
++            writes.Add((device, value));
++            return device == (uint)AsusACPI.PPT_GPUC0 ? boostResult : 1;
++        };
++        if (explicitApply)
++        {
++            using (XgMitigation.Explicit(XgOp.Power | XgOp.GpuThermal))
++                result = guard.ApplySupportedGpuLimits(true, 25, true, 5, true, 75, write);
++        }
++        else
++        {
++            result = guard.ApplySupportedGpuLimits(true, 25, true, 5, true, 75, write);
++        }
++        return result;
++    }
++
++    [Fact]
++    public void ConfirmedInactive_PermitsSupportedGpuChanges()
++    {
++        var (guard, _) = NewGuard(Inactive(), Inactive());
++        var writes = new List<(uint Device, int Value)>();
++        var result = Apply(guard, writes);
++        Assert.False(result.Suppressed);
++        Assert.Equal(3, result.Writes);
++        Assert.Contains(writes, item => item.Device == AsusACPI.GPU_POWER && item.Value == 25);
++        Assert.Contains(writes, item => item.Device == (uint)AsusACPI.PPT_GPUC0 && item.Value == 5);
++        Assert.Contains(writes, item => item.Device == (uint)AsusACPI.PPT_GPUC2 && item.Value == 75);
++    }
++
++    [Fact]
++    public void UnsupportedLimits_AreNotWritten()
++    {
++        var (guard, _) = NewGuard(Inactive());
++        var writes = new List<(uint Device, int Value)>();
++        var result = guard.ApplySupportedGpuLimits(false, 25, true, 5, false, 75, (device, value, _) =>
++        {
++            writes.Add((device, value));
++            return 1;
++        });
++        Assert.False(result.Suppressed);
++        Assert.Equal(new[] { (uint)AsusACPI.PPT_GPUC0 }, writes.Select(item => item.Device).ToArray());
++    }
++
++    [Theory]
++    [InlineData("active")]
++    [InlineData("unknown")]
++    [InlineData("failed")]
++    [InlineData("short")]
++    public void ClosedDockStates_SuppressGpuLimits(string state)
++    {
++        XgDockSnapshot snap = state switch
++        {
++            "active" => Active(),
++            "unknown" => UnknownValue(),
++            "failed" => Failed(),
++            "short" => ShortRead(),
++            _ => throw new ArgumentOutOfRangeException(nameof(state))
++        };
++        var (guard, _) = NewGuard(snap, snap);
++        var writes = new List<(uint Device, int Value)>();
++        var result = Apply(guard, writes, explicitApply: true);
++        Assert.True(result.Suppressed);
++        Assert.Empty(writes);
++        var shown = guard.PresentGpuLimits(true, true, true);
++        Assert.False(shown.Enabled);
++        Assert.Equal(XgMitigation.GpuLimitsLockedText, shown.Explanation);
++    }
++
++    [Fact]
++    public void Transition_SuppressesGpuLimits()
++    {
++        var (guard, _) = NewGuard();
++        guard.EnterTransition("activate");
++        var writes = new List<(uint Device, int Value)>();
++        var result = Apply(guard, writes, explicitApply: true);
++        Assert.True(result.Suppressed);
++        Assert.Empty(writes);
++        Assert.False(guard.GpuLimitsOpen());
++        guard.ExitTransition("activate");
++    }
++
++    [Fact]
++    public void ActivationBetweenSliderAndExecution_PreventsTheWrite()
++    {
++        var (guard, _) = NewGuard(Inactive());
++        Assert.True(guard.GpuLimitsOpen());
++        guard.EnterTransition("activate");
++        var writes = new List<(uint Device, int Value)>();
++        var result = Apply(guard, writes, explicitApply: true);
++        Assert.True(result.Suppressed);
++        Assert.Empty(writes);
++        guard.ExitTransition("activate");
++    }
++
++    [Fact]
++    public void PendingTransition_SuppressesGpuLimits()
++    {
++        var (guard, _) = NewGuard(Inactive());
++        var waiting = new ManualResetEventSlim();
++        guard.TransitionWaiting = waiting;
++        Task transition;
++        using (var held = guard.Enter("slider", "DEVS", XgOp.Power))
++        {
++            Assert.True(held.Allowed);
++            transition = Task.Run(() => guard.EnterTransition("activate"));
++            Assert.True(waiting.Wait(TimeSpan.FromSeconds(2)));
++            var writes = new List<(uint Device, int Value)>();
++            XgMitigation.GpuLimitApplyResult result = default;
++            var apply = Task.Run(() => result = Apply(guard, writes, explicitApply: true));
++            Assert.True(apply.Wait(TimeSpan.FromSeconds(2)));
++            Assert.True(result.Suppressed);
++            Assert.Empty(writes);
++        }
++        Assert.True(transition.Wait(TimeSpan.FromSeconds(2)));
++        guard.ExitTransition("activate");
++    }
++
++    [Fact]
++    public void OpeningOrRefreshing_SendsNoHardwareWrites()
++    {
++        var (guard, _) = NewGuard(Inactive(), Active(), Failed());
++        var writes = new List<(uint Device, int Value)>();
++        var opened = guard.PresentGpuLimits(true, true, false);
++        var refreshed = guard.PresentGpuLimits(true, true, true);
++        var failed = guard.PresentGpuLimits(false, true, false);
++        Assert.True(opened.Enabled);
++        Assert.Null(opened.Explanation);
++        Assert.False(refreshed.Enabled);
++        Assert.Equal(XgMitigation.GpuLimitsLockedText, refreshed.Explanation);
++        Assert.False(failed.Enabled);
++        Assert.Empty(writes);
++    }
++
++    [Fact]
++    public void Ejection_DoesNotReplayBlockedGpuLimits()
++    {
++        var (guard, _) = NewGuard(Active(), Active(), Inactive(), Inactive(), Inactive(), Inactive());
++        var writes = new List<(uint Device, int Value)>();
++        var blocked = Apply(guard, writes, explicitApply: true);
++        Assert.True(blocked.Suppressed);
++        Assert.True(guard.AwaitingExplicit);
++        var replay = Apply(guard, writes);
++        Assert.True(replay.Suppressed);
++        Assert.Empty(writes);
++
++        var explicitApply = Apply(guard, writes, explicitApply: true);
++        Assert.False(explicitApply.Suppressed);
++        Assert.Equal(3, writes.Count);
++    }
++}
+diff --git a/tests/GHelper.XgTests/XgMitigationTests.cs b/tests/GHelper.XgTests/XgMitigationTests.cs
+new file mode 100644
+index 0000000..8d78572
+--- /dev/null
++++ b/tests/GHelper.XgTests/XgMitigationTests.cs
+@@ -0,0 +1,588 @@
++using Xunit;
++
++public class XgMitigationTests
++{
++    sealed class Script
++    {
++        public Queue<XgDockSnapshot> Next { get; } = new();
++        public int Reads;
++        public XgDockSnapshot Read()
++        {
++            Reads++;
++            return Next.Dequeue();
++        }
++    }
++
++    static DecodedRead Value(int decoded, bool ok = true, uint bytes = 16, int win32 = 0)
++    {
++        var buffer = new byte[16];
++        BitConverter.GetBytes(decoded + 65536).CopyTo(buffer, 0);
++        return new DecodedRead
++        {
++            IoctlSucceeded = ok,
++            BytesReturned = bytes,
++            Win32Error = win32,
++            Buffer = buffer
++        };
++    }
++
++    static DecodedRead TransportFailed(int decodedInBuffer)
++    {
++        var buffer = new byte[16];
++        BitConverter.GetBytes(decodedInBuffer + 65536).CopyTo(buffer, 0);
++        return new DecodedRead
++        {
++            IoctlSucceeded = false,
++            BytesReturned = 16,
++            Win32Error = 6,
++            Buffer = buffer
++        };
++    }
++
++    static XgDockSnapshot Reads(DecodedRead connected, DecodedRead activation)
++        => XgDockClassifier.FromReads(connected, activation);
++
++    static XgDockSnapshot Active() => Reads(Value(1), Value(1));
++    static XgDockSnapshot Inactive() => Reads(Value(1), Value(0));
++    static XgDockSnapshot Failed() => Reads(TransportFailed(0), TransportFailed(0));
++
++    static (XgMitigation Guard, Script Script, List<string> Log) NewGuard(params XgDockSnapshot[] queued)
++    {
++        var script = new Script();
++        foreach (var item in queued) script.Next.Enqueue(item);
++        var log = new List<string>();
++        var guard = new XgMitigation { Write = log.Add };
++        guard.Enable(script.Read);
++        return (guard, script, log);
++    }
++
++    static int Writes;
++
++    static int Try(XgMitigation guard, uint device, int value, bool explicitApply = false)
++    {
++        int result;
++        if (explicitApply)
++        {
++            using (XgMitigation.Explicit(XgMitigation.OperationForDevice(device)))
++                result = guard.RunGuarded("test", device, value.ToString(), () =>
++                {
++                    Writes++;
++                    return new DevsOutcome { Result = 1, IoctlSucceeded = true, BytesReturned = 16 };
++                });
++        }
++        else
++        {
++            result = guard.RunGuarded("test", device, value.ToString(), () =>
++            {
++                Writes++;
++                return new DevsOutcome { Result = 1, IoctlSucceeded = true, BytesReturned = 16 };
++            });
++        }
++        return result;
++    }
++
++    public XgMitigationTests() => Writes = 0;
++
++    [Fact]
++    public void ActiveDock_BlocksGuardedMutations()
++    {
++        var (guard, _, _) = NewGuard(Active());
++        int result = Try(guard, (uint)AsusACPI.PPT_APUA3, 15);
++        Assert.Equal(XgMitigation.Suppressed, result);
++        Assert.Equal(0, Writes);
++    }
++
++    [Fact]
++    public void FailedOrUnknownRead_BlocksGuardedMutations()
++    {
++        var failed = NewGuard(Failed());
++        Assert.Equal(XgMitigation.Suppressed, Try(failed.Guard, AsusACPI.GPU_POWER, 25));
++        Assert.Equal(0, Writes);
++
++        var other = NewGuard(Reads(Value(1), Value(0x101)));
++        Assert.Equal(XgDockState.Unknown, other.Script.Next.Peek().State);
++        Assert.Equal(XgMitigation.Suppressed, Try(other.Guard, (uint)AsusACPI.PPT_GPUC2, 75));
++        Assert.Equal(0, Writes);
++    }
++
++    [Fact]
++    public void InitialFailedDetection_CanRecover_AndExplicitApplyWorks()
++    {
++        var (guard, _, _) = NewGuard(Failed(), Inactive(), Inactive(), Inactive());
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA0, 15));
++        Assert.False(guard.ControlsLocked());
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA0, 15));
++        Assert.Equal(0, Writes);
++        Assert.Equal(1, Try(guard, (uint)AsusACPI.PPT_APUA0, 15, explicitApply: true));
++        Assert.Equal(1, Writes);
++    }
++
++    [Fact]
++    public void ReliablyInactive_AllowsAutomaticWhenNothingWasBlocked()
++    {
++        var (guard, _, _) = NewGuard(Inactive());
++        Assert.Equal(1, Try(guard, (uint)AsusACPI.PPT_APUA0, 30));
++        Assert.Equal(1, Writes);
++        Assert.False(guard.AwaitingExplicit);
++    }
++
++    [Fact]
++    public void Transition_BlocksGuardedMutations_LifecycleStillRuns()
++    {
++        var (guard, script, _) = NewGuard();
++        guard.EnterTransition("test");
++        Assert.Equal(0, script.Reads);
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, AsusACPI.PerformanceMode, 1));
++        Assert.Equal(0, Writes);
++
++        int lifecycle = 0;
++        int result = guard.RunLifecycle("GPU XGM", AsusACPI.GPUXG, "1", () =>
++        {
++            lifecycle++;
++            return new DevsOutcome { Result = 1, IoctlSucceeded = true, BytesReturned = 16 };
++        });
++        Assert.Equal(1, result);
++        Assert.Equal(1, lifecycle);
++
++        guard.ExitTransition("test");
++        Assert.Equal(0, Writes);
++    }
++
++    [Fact]
++    public void CpuBoost_RemainsAvailableWithoutReadingDock()
++    {
++        var (guard, script, log) = NewGuard(Active());
++        int boosts = 0;
++        guard.RunCpuBoost("ComboBoost", () => boosts++);
++        Assert.Equal(1, boosts);
++        Assert.Equal(0, script.Reads);
++        Assert.Contains("api=PowerWriteACValueIndex", string.Join("\n", log));
++        Assert.Contains("action=completed", string.Join("\n", log));
++        Assert.DoesNotContain("api=DEVS", string.Join("\n", log));
++    }
++
++    [Fact]
++    public void GpuXgLifecycle_RemainsAvailableWhileActive()
++    {
++        var (guard, _, _) = NewGuard(Active());
++        Assert.False(XgMitigation.IsGuardedDevice(AsusACPI.GPUXG));
++        int calls = 0;
++        guard.RunLifecycle("GPU XGM", AsusACPI.GPUXG, "257", () =>
++        {
++            calls++;
++            return new DevsOutcome { Result = 1, IoctlSucceeded = true, BytesReturned = 16 };
++        });
++        Assert.Equal(1, calls);
++    }
++
++    [Fact]
++    public void FanReset_AndSmuThermal_CannotBypass()
++    {
++        var (guard, _, _) = NewGuard(Active(), Active(), Active());
++        Assert.True(XgMitigation.IsGuardedDevice(AsusACPI.PerformanceMode));
++        Assert.True(XgMitigation.IsGuardedDevice(AsusACPI.DevsCPUFanCurve));
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, AsusACPI.PerformanceMode, AsusACPI.PerformanceTurbo));
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, AsusACPI.DevsCPUFanCurve, 0));
++
++        bool smu = false;
++        Assert.False(guard.TryMutate("SetCPUTemp", "SMU.SetThm", "95", XgOp.Thermal, () => smu = true));
++        Assert.False(smu);
++        Assert.Equal(0, Writes);
++    }
++
++    [Fact]
++    public void NoDeferredWriteOnEject()
++    {
++        var (guard, script, _) = NewGuard(Active());
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA3, 15));
++        script.Next.Enqueue(Inactive());
++        Assert.Equal(0, Writes);
++        Assert.True(guard.AwaitingExplicit);
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA3, 15));
++        Assert.Equal(0, Writes);
++    }
++
++    [Fact]
++    public void UnrelatedDevice_IsNotBlocked()
++    {
++        var (guard, _, _) = NewGuard(Active());
++        Assert.False(XgMitigation.IsGuardedDevice(AsusACPI.UniversalControl));
++        Assert.Equal(1, Try(guard, AsusACPI.UniversalControl, 1));
++        Assert.Equal(1, Writes);
++    }
++
++    [Fact]
++    public void Classifier_DoesNotTreatCommandValueAsReadback()
++    {
++        Assert.Equal(XgValueClass.Other, XgDockClassifier.Classify(Value(0x101)));
++        Assert.Equal(XgValueClass.One, XgDockClassifier.Classify(Value(1)));
++        Assert.Equal(XgValueClass.Zero, XgDockClassifier.Classify(Value(0)));
++        Assert.Equal(XgDockState.Unknown, Reads(Value(1), Value(0x101)).State);
++        Assert.Equal(XgDockState.Active, Reads(Value(1), Value(1)).State);
++        Assert.Equal(XgDockState.Inactive, Reads(Value(0), Value(0)).State);
++        Assert.Equal(XgDockState.Inactive, Reads(Value(1), Value(0)).State);
++    }
++
++    [Fact]
++    public void TransportFailure_IsNotInactive_EvenIfBufferLooksLikeZero()
++    {
++        Assert.Equal(XgValueClass.TransportFailed, XgDockClassifier.Classify(TransportFailed(0)));
++        Assert.Equal(XgDockState.Unknown, Reads(TransportFailed(0), Value(0)).State);
++        var shortRead = Value(0, ok: true, bytes: 2);
++        Assert.Equal(XgValueClass.TransportFailed, XgDockClassifier.Classify(shortRead));
++        var staleError = Value(0, ok: true, win32: 6);
++        Assert.Equal(XgValueClass.Zero, XgDockClassifier.Classify(staleError));
++    }
++
++    [Fact]
++    public async Task InFlightMutation_DelaysTransitionUntilItFinishes()
++    {
++        var (guard, script, _) = NewGuard(Inactive());
++        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var order = new List<string>();
++        var worker = Task.Run(() =>
++        {
++            guard.RunGuarded("SetPower", (uint)AsusACPI.PPT_APUA0, "15", () =>
++            {
++                started.TrySetResult();
++                release.Task.GetAwaiter().GetResult();
++                lock (order) order.Add("write-finished");
++                return new DevsOutcome { Result = 1, IoctlSucceeded = true, BytesReturned = 16 };
++            });
++        });
++
++        Assert.Same(started.Task, await Task.WhenAny(started.Task, Task.Delay(2000)));
++        var transition = Task.Run(() =>
++        {
++            guard.EnterTransition("GPUXG activate");
++            lock (order) order.Add("transition");
++        });
++        Assert.True(SpinWait.SpinUntil(() => guard.TransitionWaits > 0, 2000));
++        Assert.NotSame(transition, await Task.WhenAny(transition, Task.Delay(100)));
++        release.TrySetResult();
++        Assert.Same(transition, await Task.WhenAny(transition, Task.Delay(2000)));
++        await worker.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.Equal(new[] { "write-finished", "transition" }, order);
++        Assert.True(guard.InTransition);
++        guard.ExitTransition("GPUXG activate");
++        Assert.Equal(1, script.Reads);
++    }
++
++    [Fact]
++    public void TemperatureTrace_DistinguishesSources_AndKeepsPriorSamples()
++    {
++        var lines = new List<string>();
++        var trace = new XgTempTrace { Write = lines.Add, MonotonicMs = () => 1000, UtcNow = () => DateTimeOffset.Parse("2026-10-26T12:00:00Z") };
++        trace.Record(Value(40), TempOrigin.FreshAsus, 40);
++        int afterFresh = lines.Count;
++        trace.RecordCached(40);
++        Assert.Equal(afterFresh, lines.Count);
++
++        trace.Record(Value(106), TempOrigin.FreshAsus, 106);
++        string joined = string.Join("\n", lines);
++        Assert.Contains("kind=history", joined);
++        Assert.Contains("origin=FreshAsus", joined);
++        Assert.Contains("decoded=40", joined);
++        Assert.Contains("decoded=106", joined);
++        Assert.Contains("transport=ok", joined);
++
++        lines.Clear();
++        trace.Record(TransportFailed(106), TempOrigin.ThermalZone, 50);
++        joined = string.Join("\n", lines);
++        Assert.Contains("origin=ThermalZone", joined);
++        Assert.Contains("transport=fail", joined);
++
++        lines.Clear();
++        trace.Record(TransportFailed(-1), TempOrigin.Failed, null);
++        Assert.True(lines.Exists(line => line.Contains("kind=sample") && line.Contains("origin=Failed") && line.Contains("transport=fail")));
++
++        lines.Clear();
++        trace.Record(Value(106), TempOrigin.FreshAsus, 106);
++        string secondHot = string.Join("\n", lines);
++        Assert.Contains("kind=sample", secondHot);
++        Assert.DoesNotContain("kind=history", secondHot);
++    }
++
++    [Fact]
++    public void ExplicitPower_DoesNotResumeThermalFanOrUv()
++    {
++        var (guard, _, _) = NewGuard(Active(), Inactive(), Inactive(), Inactive(), Inactive(), Inactive(), Inactive());
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA3, 15));
++        Assert.Equal(1, Try(guard, (uint)AsusACPI.PPT_APUA0, 20, explicitApply: true));
++        Assert.True(guard.AwaitingExplicit);
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_TEMP9E, 90));
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, AsusACPI.DevsCPUFanCurve, 1));
++        bool uv = false;
++        Assert.False(guard.TryMutate("SetUV", "SMU.SetCoAll", "0", XgOp.Uv, () => uv = true));
++        Assert.False(uv);
++
++        using (XgMitigation.Explicit(XgOp.CpuLimit))
++            Assert.Equal(1, guard.RunGuarded("limit", (uint)AsusACPI.PPT_TEMP9E, "90", () =>
++            {
++                Writes++;
++                return new DevsOutcome { Result = 1, IoctlSucceeded = true, BytesReturned = 16 };
++            }));
++        Assert.True(guard.AwaitingExplicit);
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA3, 25));
++    }
++
++    [Fact]
++    public async Task ExplicitPower_FlowsOnlyToThatCall()
++    {
++        var (guard, _, _) = NewGuard(Active(), Inactive(), Inactive(), Inactive());
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA3, 15));
++
++        int thermal;
++        using (XgMitigation.Explicit(XgOp.Power))
++        {
++            var power = Task.Run(() => Try(guard, (uint)AsusACPI.PPT_APUA0, 20));
++            var blocked = Task.Run(() => Try(guard, (uint)AsusACPI.PPT_TEMP9E, 90));
++            Assert.Equal(1, await power);
++            thermal = await blocked;
++        }
++
++        Assert.Equal(XgMitigation.Suppressed, thermal);
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_TEMP9E, 90));
++    }
++
++    [Fact]
++    public void ExplicitAction_StaysBlockedWhileActiveUnknownOrTransitioning()
++    {
++        var active = NewGuard(Active());
++        Assert.Equal(XgMitigation.Suppressed, Try(active.Guard, (uint)AsusACPI.PPT_APUA0, 15, explicitApply: true));
++
++        var unknown = NewGuard(Reads(Value(2), Value(0)));
++        Assert.Equal(XgDockState.Unknown, XgDockClassifier.FromReads(Value(2), Value(0)).State);
++        Assert.Equal(XgMitigation.Suppressed, Try(unknown.Guard, (uint)AsusACPI.PPT_APUA0, 15, explicitApply: true));
++
++        var contradictory = NewGuard(Reads(Value(0), Value(1)));
++        Assert.Equal(XgDockState.Unknown, Reads(Value(0), Value(1)).State);
++        Assert.Equal(XgMitigation.Suppressed, Try(contradictory.Guard, (uint)AsusACPI.PPT_APUA0, 15, explicitApply: true));
++
++        var (guard, _, _) = NewGuard();
++        guard.EnterTransition("activate");
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA0, 15, explicitApply: true));
++        guard.ExitTransition("activate");
++        Assert.Equal(0, Writes);
++    }
++
++    [Fact]
++    public void DockTruthTable_AcceptsOnlyEstablishedPairs()
++    {
++        XgValueClass[] classes = { XgValueClass.Zero, XgValueClass.One, XgValueClass.Other, XgValueClass.TransportFailed };
++        foreach (var connected in classes)
++        foreach (var activation in classes)
++        {
++            var state = XgDockClassifier.FromReads(Sample(connected), Sample(activation)).State;
++            XgDockState expected = connected is XgValueClass.Other or XgValueClass.TransportFailed
++                || activation is XgValueClass.Other or XgValueClass.TransportFailed
++                ? XgDockState.Unknown
++                : connected == XgValueClass.One && activation == XgValueClass.One
++                    ? XgDockState.Active
++                    : activation == XgValueClass.One
++                        ? XgDockState.Unknown
++                        : XgDockState.Inactive;
++            Assert.Equal(expected, state);
++        }
++
++        Assert.Equal(XgDockState.Unknown, Reads(Value(0x101), Value(0)).State);
++        Assert.Equal(XgDockState.Unknown, Reads(Value(0), Value(1)).State);
++        Assert.Equal(XgValueClass.Other, XgDockClassifier.Classify(Value(0x101)));
++        Assert.Equal(XgValueClass.TransportFailed, XgDockClassifier.Classify(new DecodedRead
++        {
++            IoctlSucceeded = true,
++            BytesReturned = 4,
++            Buffer = null
++        }));
++    }
++
++    [Fact]
++    public void ExitTransition_RequiresAFreshRead()
++    {
++        var (guard, script, _) = NewGuard();
++        guard.EnterTransition("activate");
++        try
++        {
++            guard.RunLifecycle("GPU XGM", AsusACPI.GPUXG, "1", () => throw new InvalidOperationException("eject failed"));
++        }
++        catch (InvalidOperationException)
++        {
++        }
++        finally
++        {
++            guard.ExitTransition("activate");
++        }
++
++        Assert.False(guard.InTransition);
++        Assert.Equal(0, script.Reads);
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA0, 15, explicitApply: true));
++        Assert.Equal(1, script.Reads);
++
++        script.Next.Enqueue(Inactive());
++        script.Next.Enqueue(Inactive());
++        Assert.Equal(XgMitigation.Suppressed, Try(guard, (uint)AsusACPI.PPT_APUA0, 15));
++        Assert.Equal(1, Try(guard, (uint)AsusACPI.PPT_APUA0, 15, explicitApply: true));
++        Assert.Equal(3, script.Reads);
++    }
++
++    [Fact]
++    public async Task NestedGuard_DoesNotDeadlockWithTransition()
++    {
++        var (guard, _, _) = NewGuard(Inactive());
++        var waiting = new ManualResetEventSlim(false);
++        guard.TransitionWaiting = waiting;
++        var nested = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
++        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var transitionDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++
++        var worker = Task.Run(() =>
++        {
++            using var lease = guard.Enter("SetPower", "DEVS", XgOp.Power);
++            Assert.True(lease.Allowed);
++            var transition = Task.Run(() =>
++            {
++                guard.EnterTransition("activate");
++                transitionDone.TrySetResult();
++            });
++            Assert.True(waiting.Wait(TimeSpan.FromSeconds(2)));
++            int result = guard.RunGuarded("PowerLimit A0", (uint)AsusACPI.PPT_APUA0, "15", () =>
++                new DevsOutcome { Result = 1, IoctlSucceeded = true, BytesReturned = 16 });
++            nested.TrySetResult(result);
++            Assert.False(transition.IsCompleted);
++            release.Task.GetAwaiter().GetResult();
++        });
++
++        Assert.Equal(1, await nested.Task.WaitAsync(TimeSpan.FromSeconds(2)));
++        Assert.False(transitionDone.Task.IsCompleted);
++        release.TrySetResult();
++        await worker.WaitAsync(TimeSpan.FromSeconds(2));
++        await transitionDone.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.True(guard.InTransition);
++        guard.ExitTransition("activate");
++    }
++
++    [Fact]
++    public async Task PendingTransition_RejectsNewAdmissionWithoutWaiting()
++    {
++        var (guard, script, _) = NewGuard(Inactive(), Inactive());
++        var waiting = new ManualResetEventSlim(false);
++        guard.TransitionWaiting = waiting;
++        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var holding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++
++        var worker = Task.Run(() =>
++        {
++            using var lease = guard.Enter("SetPower", "DEVS", XgOp.Power);
++            holding.TrySetResult();
++            release.Task.GetAwaiter().GetResult();
++        });
++
++        await holding.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        var transition = Task.Run(() => guard.EnterTransition("activate"));
++        Assert.True(waiting.Wait(TimeSpan.FromSeconds(2)));
++        Assert.True(guard.AdmissionClosed);
++
++        int result = Try(guard, (uint)AsusACPI.PPT_TEMP9E, 90, explicitApply: true);
++        Assert.Equal(XgMitigation.Suppressed, result);
++        Assert.False(transition.IsCompleted);
++        Assert.Equal(1, script.Reads);
++
++        release.TrySetResult();
++        await transition.WaitAsync(TimeSpan.FromSeconds(2));
++        await worker.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.True(guard.InTransition);
++        guard.ExitTransition("activate");
++    }
++
++    [Fact]
++    public async Task Exception_ReleasesAdmissionSoTransitionCanFinish()
++    {
++        var (guard, _, _) = NewGuard(Inactive());
++        var waiting = new ManualResetEventSlim(false);
++        guard.TransitionWaiting = waiting;
++        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++
++        var worker = Task.Run(() =>
++        {
++            var thrown = Assert.Throws<InvalidOperationException>(() =>
++                guard.RunGuarded("SetPower", (uint)AsusACPI.PPT_APUA0, "15", () =>
++                {
++                    started.TrySetResult();
++                    release.Task.GetAwaiter().GetResult();
++                    throw new InvalidOperationException("write failed");
++                }));
++            Assert.Equal("write failed", thrown.Message);
++        });
++
++        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        var transition = Task.Run(() => guard.EnterTransition("activate"));
++        Assert.True(waiting.Wait(TimeSpan.FromSeconds(2)));
++        release.TrySetResult();
++        await worker.WaitAsync(TimeSpan.FromSeconds(2));
++        await transition.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.True(guard.InTransition);
++        guard.ExitTransition("activate");
++    }
++
++    [Fact]
++    public async Task CpuPowerWrites_StayOneAdmission()
++    {
++        var (guard, script, log) = NewGuard(Inactive());
++        var waiting = new ManualResetEventSlim(false);
++        guard.TransitionWaiting = waiting;
++        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var sawBoth = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
++        int calls = 0;
++
++        var worker = Task.Run(() =>
++        {
++            Task? transition = null;
++            int written = guard.ApplyCpuPowerWrites(15, 15, false, 0, true, 20, (id, value, name) =>
++            {
++                int n = Interlocked.Increment(ref calls);
++                if (n == 1)
++                {
++                    transition = Task.Run(() => guard.EnterTransition("activate"));
++                    Assert.True(waiting.Wait(TimeSpan.FromSeconds(2)));
++                }
++                int result = guard.RunGuarded(name, id, value.ToString(), () =>
++                    new DevsOutcome { Result = 1, IoctlSucceeded = true, BytesReturned = 16 });
++                if (n == 3)
++                    sawBoth.TrySetResult(result == 1 && transition != null && !transition.IsCompleted);
++                return result;
++            });
++            Assert.Equal(1, written);
++            release.Task.GetAwaiter().GetResult();
++        });
++
++        Assert.True(await sawBoth.Task.WaitAsync(TimeSpan.FromSeconds(2)));
++        Assert.Equal(1, script.Reads);
++        string joined = string.Join("\n", log);
++        Assert.Contains("action=completed", joined);
++        Assert.DoesNotContain("action=allowed", joined);
++        Assert.Equal(3, System.Text.RegularExpressions.Regex.Matches(joined, "action=completed").Count);
++        release.TrySetResult();
++        await worker.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.True(guard.InTransition);
++        guard.ExitTransition("activate");
++    }
++
++    [Fact]
++    public void FanFallback_DoesNotTreatSuppressedAsUnsupported()
++    {
++        Assert.False(XgMitigation.FanFallbackIsHardwareRejection(XgMitigation.Suppressed, 1));
++        Assert.False(XgMitigation.FanFallbackIsHardwareRejection(1, XgMitigation.Suppressed));
++        Assert.False(XgMitigation.FanFallbackIsHardwareRejection(1, 1));
++        Assert.True(XgMitigation.FanFallbackIsHardwareRejection(0, 1));
++    }
++
++    static DecodedRead Sample(XgValueClass cls) => cls switch
++    {
++        XgValueClass.Zero => Value(0),
++        XgValueClass.One => Value(1),
++        XgValueClass.Other => Value(0x101),
++        _ => TransportFailed(0)
++    };
++}

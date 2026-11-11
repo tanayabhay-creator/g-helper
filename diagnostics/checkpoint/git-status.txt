@@ -1,0 +1,23 @@
+﻿ M app/Ally/AllyControl.cs
+ M app/AsusACPI.cs
+ M app/Fan/FanSensorControl.cs
+ M app/Fans.cs
+ M app/GHelper.csproj
+ M app/GHelper.sln
+ M app/Gpu/GPUModeControl.cs
+ M app/HardwareControl.cs
+ M app/Input/InputDispatcher.cs
+ M app/Mode/ModeControl.cs
+ M app/Overlay/HardwareOverlay.cs
+ M app/Pawn/RyzenSmu.cs
+ M app/Program.cs
+ M app/Settings.cs
+?? app/Fan/CpuFanTrace.cs
+?? app/Gpu/GpuFanPresentation.cs
+?? app/Mode/XgMitigation.cs
+?? publish-cool/
+?? publish-cpu/
+?? publish-fan/
+?? publish-framelock/
+?? publish-revert/
+?? tests/
